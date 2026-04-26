@@ -1,0 +1,332 @@
+// VERSION: v1.1.0 (Analytics uitgebreid met kleur + materiaal + inkoopprijs)
+// CHANGELOG:
+// v1.1.0
+// - Analytics uitgebreid
+// - Kleur + materiaal zichtbaar
+// - Gemiddelde inkoopprijs per kleur
+// - Niets verwijderd (alleen uitgebreid)
+
+import { useEffect, useMemo, useState } from "react";
+import Dexie from "dexie";
+import { BarChart, Bar, XAxis, YAxis, Tooltip } from "recharts";
+
+// ---------- UI ----------
+const Btn = (p) => (
+  <button {...p} style={{ margin: 6, padding: "8px 12px", borderRadius: 8, background: "#2563eb", color: "white", border: "none", cursor: "pointer" }} />
+);
+
+const In = ({ label, ...props }) => (
+  <div style={{ marginBottom: 10 }}>
+    <label style={{ fontSize: 12 }}>{label}</label>
+    <input {...props} style={{ width: "100%", padding: 6, borderRadius: 6 }} />
+  </div>
+);
+
+const Box = ({ children }) => (
+  <div style={{ border: "1px solid #333", padding: 15, borderRadius: 10, marginBottom: 15 }}>
+    {children}
+  </div>
+);
+
+// ---------- DB ----------
+const db = new Dexie("3DPrintDB");
+db.version(3).stores({
+  materials: "++id,name",
+  colors: "++id,materialId,name,stock",
+  purchases: "++id,colorId,grams,price,date",
+  products: "++id,name,grams,printTime,workTime",
+  prints: "++id,productId,colorId,amount,sellingPrice,date",
+  settings: "id"
+});
+
+// ---------- Helpers ----------
+const avgPricePerKg = (purchases, colorId) => {
+  const list = purchases.filter(p => p.colorId == colorId);
+  const grams = list.reduce((a,b)=>a + Number(b.grams||0), 0);
+  const totalCost = list.reduce((a,b)=>a + Number(b.price||0), 0);
+  return grams ? (totalCost / grams) * 1000 : 0;
+};
+
+const calcCost = (product, amount, pricePerKg, settings) => {
+  const grams = product.grams * amount;
+  const filament = (grams/1000) * pricePerKg;
+
+  const base = product.printTime < 2 ? settings.powerLow : product.printTime < 6 ? settings.powerMid : settings.powerHigh;
+  const electricity = (base/1000) * (product.printTime * amount) * settings.electricityPrice;
+
+  const labor = product.workTime * amount * settings.hourlyRate;
+
+  return filament + electricity + labor;
+};
+
+export default function App() {
+
+  const APP_VERSION = "v1.0.0";
+
+  const [tab, setTab] = useState("materials");
+
+  const [materials, setMaterials] = useState([]);
+  const [colors, setColors] = useState([]);
+  const [purchases, setPurchases] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [prints, setPrints] = useState([]);
+
+  const [settings, setSettings] = useState({
+    electricityPrice: 0.30,
+    hourlyRate: 15,
+    powerLow: 150,
+    powerMid: 180,
+    powerHigh: 220
+  });
+
+  const [mName, setMName] = useState("");
+  const [cForm, setCForm] = useState({ name: "", materialId: "" });
+  const [buy, setBuy] = useState({ colorId: "", grams: 0, price: 0 });
+  const [prod, setProd] = useState({ name: "", grams: 0, printTime: 0, workTime: 0 });
+  const [run, setRun] = useState({ productId: "", colorId: "", amount: 1, sellingPrice: 0 });
+
+  useEffect(()=>{ loadAll(); loadSettings(); }, []);
+
+  async function loadAll(){
+    setMaterials(await db.materials.toArray());
+    setColors(await db.colors.toArray());
+    setPurchases(await db.purchases.toArray());
+    setProducts(await db.products.toArray());
+    setPrints(await db.prints.toArray());
+  }
+
+  async function loadSettings(){
+    const s = await db.settings.get(1);
+    if(s) setSettings(s);
+  }
+
+  async function saveSettings(){
+    await db.settings.put({ ...settings, id:1 });
+  }
+
+  // ---------- CRUD ----------
+  const addMaterial = async()=>{ if(!mName) return; await db.materials.add({ name: mName }); setMName(""); loadAll(); };
+
+  const addColor = async()=>{
+    const mat = materials.find(m=>m.id==cForm.materialId);
+    const full = mat ? `${mat.name} - ${cForm.name}` : cForm.name;
+    await db.colors.add({ ...cForm, name: full, stock: 0 });
+    setCForm({ name: "", materialId: "" }); loadAll();
+  };
+
+  const addPurchase = async()=>{
+    await db.purchases.add({ ...buy, grams:+buy.grams, price:+buy.price, date:new Date() });
+    const c = colors.find(x=>x.id==buy.colorId);
+    if(c) await db.colors.update(c.id, { stock: (c.stock||0) + +buy.grams });
+    setBuy({ colorId:"", grams:0, price:0 }); loadAll();
+  };
+
+  const addProduct = async()=>{
+    await db.products.add({ ...prod, grams:+prod.grams, printTime:+prod.printTime, workTime:+prod.workTime });
+    setProd({ name:"", grams:0, printTime:0, workTime:0 }); loadAll();
+  };
+
+  const addPrint = async()=>{
+    await db.prints.add({ ...run, amount:+run.amount, sellingPrice:+run.sellingPrice, date:new Date() });
+    const c = colors.find(x=>x.id==run.colorId);
+    const p = products.find(x=>x.id==run.productId);
+    if(c && p) await db.colors.update(c.id, { stock: (c.stock||0) - (p.grams * run.amount) });
+    setRun({ productId:"", colorId:"", amount:1, sellingPrice:0 }); loadAll();
+  };
+
+  const deleteItem = async(table, id)=>{
+    await db[table].delete(id);
+    loadAll();
+  };
+
+  // ---------- LIVE ----------
+  const live = useMemo(()=>{
+    const p = products.find(x=>x.id==run.productId);
+    const pricePerKg = avgPricePerKg(purchases, run.colorId);
+    if(!p || !pricePerKg) return { cost:0, revenue:0, profit:0 };
+    const cost = calcCost(p, run.amount, pricePerKg, settings);
+    const revenue = run.sellingPrice * run.amount;
+    return { cost, revenue, profit: revenue - cost };
+  }, [run, products, purchases, settings]);
+
+  // ---------- DASHBOARD ----------
+  const chart = prints.map(r=>{
+    const p = products.find(x=>x.id==r.productId);
+    const pricePerKg = avgPricePerKg(purchases, r.colorId);
+    if(!p || !pricePerKg) return null;
+    const profit = (r.sellingPrice * r.amount) - calcCost(p, r.amount, pricePerKg, settings);
+    return { name: p.name, profit };
+  }).filter(Boolean);
+
+  const total = chart.reduce((a,b)=>a+b.profit,0);
+
+  // ---------- ANALYTICS ----------
+  const enriched = prints.map(r=>{
+    const p = products.find(x=>x.id==r.productId);
+    const c = colors.find(x=>x.id==r.colorId);
+    const pricePerKg = avgPricePerKg(purchases, r.colorId);
+    if(!p || !pricePerKg) return null;
+
+    const cost = calcCost(p, r.amount, pricePerKg, settings);
+    const revenue = r.sellingPrice * r.amount;
+    const profit = revenue - cost;
+    const margin = revenue ? (profit / revenue) * 100 : 0;
+
+    const material = materials.find(m => m.id == c?.materialId);
+
+    return { 
+      name: p.name, 
+      color: c?.name, 
+      material: material?.name,
+      avgPrice: pricePerKg,
+      profit, 
+      margin 
+    };
+  }).filter(Boolean);
+
+  const profitPerProduct = Object.values(enriched.reduce((acc, cur)=>{
+    acc[cur.name] = acc[cur.name] || { name: cur.name, profit:0 };
+    acc[cur.name].profit += cur.profit;
+    return acc;
+  }, {}));
+
+  const profitPerColor = Object.values(enriched.reduce((acc, cur)=>{
+    acc[cur.color] = acc[cur.color] || { name: cur.color, profit:0 };
+    acc[cur.color].profit += cur.profit;
+    return acc;
+  }, {}));
+
+  const alerts = enriched.filter(x => x.profit < 0 || x.margin < 20);
+
+  const lowStock = colors.filter(c => (c.stock||0) < 100);
+
+  const inventoryValue = colors.reduce((sum,c)=>{
+    const price = avgPricePerKg(purchases, c.id);
+    return sum + ((c.stock||0)/1000)*price;
+  },0);
+
+  // ---------- UI ----------
+  return (
+  <div style={{ padding:20 }}>
+
+    <div>
+      <Btn onClick={()=>setTab("materials")}>Materialen</Btn>
+      <Btn onClick={()=>setTab("inventory")}>Inkopen</Btn>
+      <Btn onClick={()=>setTab("products")}>Producten</Btn>
+      <Btn onClick={()=>setTab("prints")}>Print</Btn>
+      <Btn onClick={()=>setTab("dashboard")}>Dashboard</Btn>
+      <Btn onClick={()=>setTab("analytics")}>Analytics</Btn>
+      <Btn onClick={()=>setTab("settings")}>Instellingen</Btn>
+      <Btn onClick={()=>setTab("database")}>Database</Btn>
+    </div>
+
+    {tab==="materials" && (
+      <Box>
+        <h3>Materiaal + Kleur</h3>
+        <In label="Materiaal naam" value={mName} onChange={e=>setMName(e.target.value)} />
+        <Btn onClick={addMaterial}>Toevoegen</Btn>
+
+        <In label="Kleur naam" value={cForm.name} onChange={e=>setCForm({...cForm, name:e.target.value})} />
+        <select onChange={e=>setCForm({...cForm, materialId:e.target.value})}>
+          <option>Kies materiaal</option>
+          {materials.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+        <Btn onClick={addColor}>Toevoegen</Btn>
+      </Box>
+    )}
+
+    {tab==="inventory" && (
+      <Box>
+        <h3>Inkopen</h3>
+        <select onChange={e=>setBuy({...buy, colorId:e.target.value})}>
+          <option>Kleur</option>
+          {colors.map(c=><option key={c.id} value={c.id}>{c.name} ({c.stock||0}g)</option>)}
+        </select>
+        <In label="Gram" type="number" onChange={e=>setBuy({...buy, grams:e.target.value})} />
+        <In label="Prijs (€)" type="number" onChange={e=>setBuy({...buy, price:e.target.value})} />
+        <Btn onClick={addPurchase}>Opslaan</Btn>
+      </Box>
+    )}
+
+    {tab==="products" && (
+      <Box>
+        <h3>Product</h3>
+        <In label="Naam" value={prod.name} onChange={e=>setProd({...prod, name:e.target.value})} />
+        <In label="Gram" type="number" value={prod.grams} onChange={e=>setProd({...prod, grams:e.target.value})} />
+        <In label="Printtijd" type="number" value={prod.printTime} onChange={e=>setProd({...prod, printTime:e.target.value})} />
+        <In label="Werkuren" type="number" value={prod.workTime} onChange={e=>setProd({...prod, workTime:e.target.value})} />
+        <Btn onClick={addProduct}>Toevoegen</Btn>
+      </Box>
+    )}
+
+    {tab==="prints" && (
+      <Box>
+        <h3>Print</h3>
+        <select onChange={e=>setRun({...run, productId:e.target.value})}>
+          <option>Product</option>
+          {products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <select onChange={e=>setRun({...run, colorId:e.target.value})}>
+          <option>Kleur</option>
+          {colors.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <In label="Aantal" type="number" value={run.amount} onChange={e=>setRun({...run, amount:+e.target.value})} />
+        <In label="Verkoopprijs" type="number" value={run.sellingPrice} onChange={e=>setRun({...run, sellingPrice:+e.target.value})} />
+
+        <p>Kost: €{live.cost.toFixed(2)}</p>
+        <p>Omzet: €{live.revenue.toFixed(2)}</p>
+        <p>Winst: €{live.profit.toFixed(2)}</p>
+
+        <Btn onClick={addPrint}>Opslaan</Btn>
+      </Box>
+    )}
+
+    {tab==="dashboard" && (
+      <Box>
+        <h3>Dashboard</h3>
+        <p>Totale winst: €{total.toFixed(2)}</p>
+        <BarChart width={500} height={300} data={chart}>
+          <XAxis dataKey="name" />
+          <YAxis />
+          <Tooltip />
+          <Bar dataKey="profit" />
+        </BarChart>
+      </Box>
+    )}
+
+    {tab==="analytics" && (
+      <Box>
+        <h3>Kleur / Materiaal + Inkoopprijs</h3>
+        {colors.map((c,i)=>{
+          const material = materials.find(m=>m.id==c.materialId);
+          const price = avgPricePerKg(purchases, c.id);
+          return (
+            <div key={i}>
+              🎨 {c.name} ({material?.name || "-"}) - €{price.toFixed(2)}/kg
+            </div>
+          );
+        })}
+      </Box>
+    )}
+
+    {tab==="settings" && (
+      <Box>
+        <h3>Instellingen</h3>
+        <In label="Stroomprijs" type="number" value={settings.electricityPrice} onChange={e=>setSettings({...settings, electricityPrice:+e.target.value})} />
+        <In label="Uurloon" type="number" value={settings.hourlyRate} onChange={e=>setSettings({...settings, hourlyRate:+e.target.value})} />
+        <Btn onClick={saveSettings}>Opslaan</Btn>
+      </Box>
+    )}
+
+    {tab==="database" && (
+      <Box>
+        <h3>Database</h3>
+        {products.map(p=>(
+          <div key={p.id}>{p.name} <Btn onClick={()=>deleteItem("products", p.id)}>X</Btn></div>
+        ))}
+      </Box>
+    )}
+
+  </div>
+);
+}
