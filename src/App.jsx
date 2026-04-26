@@ -64,6 +64,17 @@ db.version(6).stores({
   settings: "id",
 });
 
+db.version(7).stores({
+  materials: "++id,name",
+  colors: "++id,materialId,name,stock",
+  purchases: "++id,colorId,grams,price,date",
+  parts: "++id,name,category,stock",
+  partPurchases: "++id,partId,amount,price,date",
+  products: "++id,name,grams,printTime,workTime,link,image",
+  prints: "++id,productId,colorId,amount,sellingPrice,date",
+  settings: "id",
+});
+
 // ---------- HELPERS ----------
 const avgPricePerKg = (purchases, colorId) => {
   const list = purchases.filter((purchase) => purchase.colorId == colorId);
@@ -72,7 +83,10 @@ const avgPricePerKg = (purchases, colorId) => {
   return grams ? (total / grams) * 1000 : 0;
 };
 
-const calcCost = (product, amount, pricePerKg, settings) => {
+const getComponentCostPerUnit = (product) =>
+  (product.components || []).reduce((sum, component) => sum + Number(component.cost || 0), 0);
+
+const calcCostBreakdown = (product, amount, pricePerKg, settings) => {
   const grams = Number(product.grams || 0) * amount * (1 + (settings.waste || 0) / 100);
   const filament = (grams / 1000) * pricePerKg;
   const power =
@@ -83,7 +97,14 @@ const calcCost = (product, amount, pricePerKg, settings) => {
         : settings.powerHigh;
   const electricity = (power / 1000) * (Number(product.printTime || 0) * amount) * settings.electricityPrice;
   const labor = Number(product.workTime || 0) * amount * settings.hourlyRate;
-  return filament + electricity + labor;
+  const parts = getComponentCostPerUnit(product) * amount;
+  return {
+    filament,
+    parts,
+    electricity,
+    labor,
+    total: filament + parts + electricity + labor,
+  };
 };
 
 export default function App() {
@@ -93,6 +114,8 @@ export default function App() {
   const [materials, setMaterials] = useState([]);
   const [colors, setColors] = useState([]);
   const [purchases, setPurchases] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [partPurchases, setPartPurchases] = useState([]);
   const [products, setProducts] = useState([]);
   const [prints, setPrints] = useState([]);
 
@@ -109,9 +132,12 @@ export default function App() {
   const [mName, setMName] = useState("");
   const [cForm, setCForm] = useState({ name: "", materialId: "" });
   const [buy, setBuy] = useState({ colorId: "", grams: 0, price: 0 });
-  const [prod, setProd] = useState({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "" });
+  const [partForm, setPartForm] = useState({ name: "", category: "" });
+  const [partBuy, setPartBuy] = useState({ partId: "", amount: 1, price: 0 });
+  const [prod, setProd] = useState({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
   const [editProduct, setEditProduct] = useState(null);
   const [run, setRun] = useState({ productId: "", colorId: "", amount: 1, sellingPrice: 0 });
+  const [componentForm, setComponentForm] = useState({ name: "", cost: 0 });
 
   const showToast = (message, success = true) => {
     setToast({ message, success });
@@ -133,6 +159,8 @@ export default function App() {
     setMaterials(await db.materials.toArray());
     setColors(await db.colors.toArray());
     setPurchases(await db.purchases.toArray());
+    setParts(await db.parts.toArray());
+    setPartPurchases(await db.partPurchases.toArray());
     setProducts(await db.products.toArray());
     setPrints(await db.prints.toArray());
   }
@@ -178,6 +206,8 @@ export default function App() {
       materials: await db.materials.toArray(),
       colors: await db.colors.toArray(),
       purchases: await db.purchases.toArray(),
+      parts: await db.parts.toArray(),
+      partPurchases: await db.partPurchases.toArray(),
       products: await db.products.toArray(),
       prints: await db.prints.toArray(),
       settings: [{ ...settings, id: 1 }],
@@ -302,6 +332,68 @@ export default function App() {
     showToast("Inkoop toegevoegd");
   };
 
+  const addPart = async () => {
+    const name = partForm.name.trim();
+    if (!name) {
+      showToast("Vul een onderdeelnaam in", false);
+      return;
+    }
+
+    const exists = parts.find((part) => part.name.toLowerCase() === name.toLowerCase());
+    if (exists) {
+      showToast("Onderdeel bestaat al", false);
+      return;
+    }
+
+    await db.parts.add({
+      name,
+      category: partForm.category.trim(),
+      stock: 0,
+    });
+    setPartForm({ name: "", category: "" });
+    await loadAll();
+    showToast("Onderdeel toegevoegd");
+  };
+
+  const deletePart = async (id) => {
+    await db.parts.delete(id);
+    const relatedPurchases = partPurchases.filter((purchase) => purchase.partId == id);
+    for (const purchase of relatedPurchases) {
+      await db.partPurchases.delete(purchase.id);
+    }
+    await loadAll();
+    showToast("Onderdeel verwijderd");
+  };
+
+  const addPartPurchase = async () => {
+    if (!partBuy.partId || !partBuy.amount || !partBuy.price) {
+      showToast("Vul onderdeel, aantal en prijs in", false);
+      return;
+    }
+
+    await db.partPurchases.add({
+      partId: Number(partBuy.partId),
+      amount: Number(partBuy.amount),
+      price: Number(partBuy.price),
+      date: new Date(),
+    });
+
+    const part = parts.find((entry) => entry.id == partBuy.partId);
+    if (part) {
+      await db.parts.update(part.id, { stock: Number(part.stock || 0) + Number(partBuy.amount) });
+    }
+
+    setPartBuy({ partId: "", amount: 1, price: 0 });
+    await loadAll();
+    showToast("Onderdeleninkoop toegevoegd");
+  };
+
+  const updatePartStock = async (id, value) => {
+    await db.parts.update(id, { stock: Number(value) });
+    await loadAll();
+    showToast("Onderdelenvoorraad aangepast");
+  };
+
   const saveProduct = async () => {
     if (!prod.name.trim()) {
       showToast("Geef het product een naam", false);
@@ -316,6 +408,13 @@ export default function App() {
       workTime: Number(prod.workTime),
       link: prod.link.trim(),
       image: prod.image.trim(),
+      components: (prod.components || [])
+        .filter((component) => component.name?.trim())
+        .map((component) => ({
+          id: component.id || crypto.randomUUID(),
+          name: component.name.trim(),
+          cost: Number(component.cost || 0),
+        })),
     };
 
     if (editProduct) {
@@ -327,13 +426,22 @@ export default function App() {
       showToast("Product toegevoegd");
     }
 
-    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "" });
+    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
+    setComponentForm({ name: "", cost: 0 });
     await loadAll();
   };
 
   const startEdit = (product) => {
     setEditProduct(product);
-    setProd(product);
+    setProd({
+      ...product,
+      components: (product.components || []).map((component) => ({
+        id: component.id || crypto.randomUUID(),
+        name: component.name || "",
+        cost: Number(component.cost || 0),
+      })),
+    });
+    setComponentForm({ name: "", cost: 0 });
     setTab("products");
   };
 
@@ -376,43 +484,113 @@ export default function App() {
     showToast("Voorraad aangepast");
   };
 
+  const addComponentToProduct = () => {
+    const name = componentForm.name.trim();
+    const cost = Number(componentForm.cost);
+
+    if (!name) {
+      showToast("Geef het onderdeel een naam", false);
+      return;
+    }
+
+    if (cost < 0) {
+      showToast("Onderdeelkost mag niet negatief zijn", false);
+      return;
+    }
+
+    setProd((current) => ({
+      ...current,
+      components: [
+        ...(current.components || []),
+        {
+          id: crypto.randomUUID(),
+          name,
+          cost,
+        },
+      ],
+    }));
+    setComponentForm({ name: "", cost: 0 });
+  };
+
+  const removeComponentFromProduct = (componentId) => {
+    setProd((current) => ({
+      ...current,
+      components: (current.components || []).filter((component) => component.id !== componentId),
+    }));
+  };
+
   // ---------- LIVE ----------
   const live = useMemo(() => {
     const product = products.find((entry) => entry.id == run.productId);
     const pricePerKg = avgPricePerKg(purchases, run.colorId);
 
-    if (!product || !pricePerKg) {
-      return { cost: 0, revenue: 0, profit: 0, suggested: 0 };
+    if (!product) {
+      return { filament: 0, parts: 0, electricity: 0, labor: 0, cost: 0, revenue: 0, profit: 0, suggested: 0 };
     }
 
-    const cost = calcCost(product, Number(run.amount || 0), pricePerKg, settings);
+    const breakdown = calcCostBreakdown(product, Number(run.amount || 0), pricePerKg, settings);
     const revenue = Number(run.sellingPrice || 0) * Number(run.amount || 0);
-    const suggested = cost * (1 + (settings.margin || 30) / 100);
+    const suggested = breakdown.total * (1 + (settings.margin || 30) / 100);
 
     return {
-      cost,
+      ...breakdown,
+      cost: breakdown.total,
       revenue,
-      profit: revenue - cost,
+      profit: revenue - breakdown.total,
       suggested,
     };
   }, [products, purchases, run, settings]);
 
   // ---------- DASHBOARD ----------
-  const chart = prints
+  const printAnalytics = prints
     .map((print) => {
       const product = products.find((entry) => entry.id == print.productId);
       const pricePerKg = avgPricePerKg(purchases, print.colorId);
 
-      if (!product || !pricePerKg) {
+      if (!product) {
         return null;
       }
 
-      const profit = Number(print.sellingPrice) * Number(print.amount) - calcCost(product, Number(print.amount), pricePerKg, settings);
-      return { name: product.name, profit };
+      const costBreakdown = calcCostBreakdown(product, Number(print.amount), pricePerKg, settings);
+      const revenue = Number(print.sellingPrice) * Number(print.amount);
+      const profit = revenue - costBreakdown.total;
+      return {
+        name: product.name,
+        revenue,
+        profit,
+        cost: costBreakdown.total,
+        filament: costBreakdown.filament,
+        parts: costBreakdown.parts,
+        electricity: costBreakdown.electricity,
+        labor: costBreakdown.labor,
+      };
     })
     .filter(Boolean);
 
-  const total = chart.reduce((sum, entry) => sum + entry.profit, 0);
+  const chart = printAnalytics.map((entry) => ({ name: entry.name, profit: entry.profit }));
+  const total = printAnalytics.reduce((sum, entry) => sum + entry.profit, 0);
+  const totalRevenue = printAnalytics.reduce((sum, entry) => sum + entry.revenue, 0);
+  const totalCost = printAnalytics.reduce((sum, entry) => sum + entry.cost, 0);
+  const totalFilamentCost = printAnalytics.reduce((sum, entry) => sum + entry.filament, 0);
+  const totalProductPartCost = printAnalytics.reduce((sum, entry) => sum + entry.parts, 0);
+  const totalElectricityCost = printAnalytics.reduce((sum, entry) => sum + entry.electricity, 0);
+  const totalLaborCost = printAnalytics.reduce((sum, entry) => sum + entry.labor, 0);
+  const totalMaterialSpend = purchases.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
+  const totalPartSpend = partPurchases.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
+  const totalSupplySpend = totalMaterialSpend + totalPartSpend;
+  const netResult = totalRevenue - totalSupplySpend - totalElectricityCost - totalLaborCost;
+  const stockMaterialValue = colors.reduce((sum, color) => {
+    const stock = Number(color.stock || 0);
+    const pricePerKg = avgPricePerKg(purchases, color.id);
+    return sum + (stock / 1000) * pricePerKg;
+  }, 0);
+  const stockPartValue = parts.reduce((sum, part) => {
+    const relatedPurchases = partPurchases.filter((purchase) => purchase.partId == part.id);
+    const totalAmount = relatedPurchases.reduce((amount, purchase) => amount + Number(purchase.amount || 0), 0);
+    const totalSpent = relatedPurchases.reduce((amount, purchase) => amount + Number(purchase.price || 0), 0);
+    const avgUnitCost = totalAmount ? totalSpent / totalAmount : 0;
+    return sum + Number(part.stock || 0) * avgUnitCost;
+  }, 0);
 
   // ---------- ANALYTICS ----------
   const avgPrices = materials.flatMap((material) =>
@@ -450,10 +628,10 @@ export default function App() {
         <div style={{ marginBottom: 16 }}>
           <Btn onClick={() => setTab("materials")}>Materialen</Btn>
           <Btn onClick={() => setTab("inventory")}>Inkopen</Btn>
+          <Btn onClick={() => setTab("parts")}>Overige onderdelen</Btn>
           <Btn onClick={() => setTab("products")}>Producten</Btn>
           <Btn onClick={() => setTab("prints")}>Print</Btn>
-          <Btn onClick={() => setTab("dashboard")}>Dashboard</Btn>
-          <Btn onClick={() => setTab("analytics")}>Analytics</Btn>
+          <Btn onClick={() => setTab("dashboard")}>Overzicht</Btn>
           <Btn onClick={() => setTab("settings")}>Instellingen</Btn>
         </div>
 
@@ -555,6 +733,87 @@ export default function App() {
           </Box>
         )}
 
+        {tab === "parts" && (
+          <Box>
+            <h3>Overige onderdelen</h3>
+            <In
+              label="Onderdeel naam"
+              value={partForm.name}
+              onChange={(event) => setPartForm({ ...partForm, name: event.target.value })}
+            />
+            <In
+              label="Categorie"
+              value={partForm.category}
+              onChange={(event) => setPartForm({ ...partForm, category: event.target.value })}
+            />
+            <Btn onClick={addPart}>Toevoegen</Btn>
+
+            <h4>Inkoop registreren</h4>
+            <select
+              value={partBuy.partId}
+              onChange={(event) => setPartBuy({ ...partBuy, partId: event.target.value })}
+              style={selectStyle}
+            >
+              <option value="">Onderdeel</option>
+              {parts.map((part) => (
+                <option key={part.id} value={part.id}>
+                  {part.name}
+                </option>
+              ))}
+            </select>
+            <In
+              label="Aantal"
+              type="number"
+              value={partBuy.amount}
+              onChange={(event) => setPartBuy({ ...partBuy, amount: event.target.value })}
+            />
+            <In
+              label="Totale prijs"
+              type="number"
+              value={partBuy.price}
+              onChange={(event) => setPartBuy({ ...partBuy, price: event.target.value })}
+            />
+            <Btn onClick={addPartPurchase}>Inkoop toevoegen</Btn>
+
+            <h4>Voorraad</h4>
+            {parts.length === 0 && <p>Nog geen overige onderdelen toegevoegd.</p>}
+            {parts.map((part) => (
+              <div
+                key={part.id}
+                style={{
+                  marginBottom: 8,
+                  padding: 10,
+                  borderRadius: 8,
+                  background: "#111827",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <strong>{part.name}</strong>
+                  {part.category && <span style={{ opacity: 0.75 }}>({part.category})</span>}
+                  <span>- {part.stock || 0} stuks</span>
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                  <Btn onClick={() => updatePartStock(part.id, Number(part.stock || 0) - 1)}>-1</Btn>
+                  <Btn onClick={() => updatePartStock(part.id, Number(part.stock || 0) + 1)}>+1</Btn>
+                  <input
+                    type="number"
+                    defaultValue={part.stock || 0}
+                    style={{ ...inputStyle, width: 100 }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        updatePartStock(part.id, event.target.value);
+                      }
+                    }}
+                  />
+                  <Btn style={{ background: "#dc2626" }} onClick={() => deletePart(part.id)}>
+                    Verwijderen
+                  </Btn>
+                </div>
+              </div>
+            ))}
+          </Box>
+        )}
+
         {tab === "products" && (
           <Box>
             <In label="Naam" value={prod.name} onChange={(event) => setProd({ ...prod, name: event.target.value })} />
@@ -577,6 +836,50 @@ export default function App() {
               value={prod.image}
               onChange={(event) => setProd({ ...prod, image: event.target.value })}
             />
+            <h3>Onderdelen per product</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(120px, 1fr) auto", gap: 10, alignItems: "end" }}>
+              <In
+                label="Onderdeel naam"
+                value={componentForm.name}
+                onChange={(event) => setComponentForm({ ...componentForm, name: event.target.value })}
+              />
+              <In
+                label="Kostprijs"
+                type="number"
+                value={componentForm.cost}
+                onChange={(event) => setComponentForm({ ...componentForm, cost: Number(event.target.value) })}
+              />
+              <Btn onClick={addComponentToProduct}>Onderdeel toevoegen</Btn>
+            </div>
+            {(prod.components || []).length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                {(prod.components || []).map((component) => (
+                  <div
+                    key={component.id}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: 10,
+                      marginBottom: 8,
+                      borderRadius: 8,
+                      background: "#111827",
+                    }}
+                  >
+                    <span>
+                      {component.name} - EUR {Number(component.cost || 0).toFixed(2)}
+                    </span>
+                    <Btn style={{ background: "#dc2626" }} onClick={() => removeComponentFromProduct(component.id)}>
+                      Verwijderen
+                    </Btn>
+                  </div>
+                ))}
+                <p style={{ marginBottom: 0 }}>
+                  Onderdelenkosten per stuk: EUR {getComponentCostPerUnit(prod).toFixed(2)}
+                </p>
+              </div>
+            )}
             <div style={{ marginBottom: 12 }}>
               <Btn onClick={saveProduct}>{editProduct ? "Bijwerken" : "Opslaan"}</Btn>
               {editProduct && (
@@ -584,7 +887,8 @@ export default function App() {
                   style={{ background: "#4b5563" }}
                   onClick={() => {
                     setEditProduct(null);
-                    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "" });
+                    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
+                    setComponentForm({ name: "", cost: 0 });
                   }}
                 >
                   Annuleren
@@ -614,6 +918,9 @@ export default function App() {
                   <div style={{ fontWeight: "bold", marginBottom: 6 }}>{product.name}</div>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>
                     {product.grams}g | {product.printTime}u | {product.workTime}u werk
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
+                    Onderdelen: EUR {getComponentCostPerUnit(product).toFixed(2)} per stuk
                   </div>
                   <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
                     <Btn onClick={() => startEdit(product)}>Bewerken</Btn>
@@ -679,7 +986,11 @@ export default function App() {
               onChange={(event) => setRun({ ...run, sellingPrice: Number(event.target.value) })}
             />
 
-            <p>Kost: EUR {live.cost.toFixed(2)}</p>
+            <p>Filament: EUR {live.filament.toFixed(2)}</p>
+            <p>Onderdelen: EUR {live.parts.toFixed(2)}</p>
+            <p>Stroom: EUR {live.electricity.toFixed(2)}</p>
+            <p>Arbeid: EUR {live.labor.toFixed(2)}</p>
+            <p>Kost totaal: EUR {live.cost.toFixed(2)}</p>
             <p>Aanbevolen prijs: EUR {live.suggested.toFixed(2)}</p>
             <p style={{ color: live.profit < 0 ? "#fca5a5" : "#86efac" }}>Winst: EUR {live.profit.toFixed(2)}</p>
 
@@ -689,8 +1000,24 @@ export default function App() {
 
         {tab === "dashboard" && (
           <Box>
-            <h3>Dashboard</h3>
-            <p>Totale winst: EUR {total.toFixed(2)}</p>
+            <h3>Overzicht</h3>
+            <p>Totale omzet uit verkopen: EUR {totalRevenue.toFixed(2)}</p>
+            <p>Materiaalverbruik in verkochte prints: EUR {totalFilamentCost.toFixed(2)}</p>
+            <p>Productonderdelen in verkochte prints: EUR {totalProductPartCost.toFixed(2)}</p>
+            <p>Stroomkosten in verkochte prints: EUR {totalElectricityCost.toFixed(2)}</p>
+            <p>Arbeidskosten in verkochte prints: EUR {totalLaborCost.toFixed(2)}</p>
+            <p>Totale kostprijs van verkochte prints: EUR {totalCost.toFixed(2)}</p>
+            <p>Brutowinst op verkochte prints: EUR {total.toFixed(2)}</p>
+
+            <h4>Inkoop en cashflow</h4>
+            <p>Totale materiaalinkoop: EUR {totalMaterialSpend.toFixed(2)}</p>
+            <p>Totale overige onderdeleninkoop: EUR {totalPartSpend.toFixed(2)}</p>
+            <p>Totale inkoopuitgaven: EUR {totalSupplySpend.toFixed(2)}</p>
+            <p style={{ color: netResult < 0 ? "#fca5a5" : "#86efac" }}>Netto resultaat inclusief inkopen: EUR {netResult.toFixed(2)}</p>
+
+            <h4>Voorraadwaarde</h4>
+            <p>Filamentvoorraad op basis van gemiddelde inkoopprijs: EUR {stockMaterialValue.toFixed(2)}</p>
+            <p>Overige onderdelenvoorraad op basis van gemiddelde inkoopprijs: EUR {stockPartValue.toFixed(2)}</p>
 
             <BarChart width={400} height={250} data={chart}>
               <XAxis dataKey="name" stroke="#d1d5db" />
@@ -720,12 +1047,7 @@ export default function App() {
                   {entry.name}: EUR {entry.profit.toFixed(2)}
                 </div>
               ))}
-          </Box>
-        )}
-
-        {tab === "analytics" && (
-          <Box>
-            <h3>Gemiddelde prijs per kilo</h3>
+            <h4>Gemiddelde prijs per kilo</h4>
             {avgPrices.length === 0 && <p>Nog geen prijsdata beschikbaar.</p>}
             {avgPrices.map((entry) => (
               <div key={entry.name}>
