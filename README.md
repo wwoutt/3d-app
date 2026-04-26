@@ -36,14 +36,16 @@ The app currently supports:
 
 ## Local-first storage
 
-This app runs locally in your browser and stores its data locally on your machine.
+This app runs locally in your browser and stores its data in a local JSON file on your machine.
 
-- It uses [Dexie.js](https://dexie.org/docs), which is a wrapper around browser [IndexedDB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API)
+- It uses a local JSON data file for durable storage
+- It also uses [Dexie.js](https://dexie.org/docs), which is a wrapper around browser [IndexedDB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API), to help the app manage local data inside the browser
 - Your data is not sent to a cloud backend by this project
-- Your database is stored in the browser profile you use to open the app
-- If you open the app in a different browser or clear browser storage, your data will not automatically follow you
+- Your main data can live in a file you choose on disk, for example `3d-print-manager-data.json`
+- If browser storage is cleared, your data file still exists on disk
+- If you open the app in another supported browser, you can reconnect the same data file manually
 
-Because of that, it is a good idea to use the built-in export feature regularly.
+For the best experience, create or connect a local data file from the `Instellingen` section inside the app.
 
 ## Tech stack
 
@@ -102,6 +104,17 @@ http://localhost:5173
 ```
 
 Open that URL in your browser.
+
+### 5. Create or connect your local data file
+
+After the app opens:
+
+1. Go to `Instellingen`
+2. Under local file storage, choose `Nieuw databestand` to create a new file
+3. Or choose `Bestaand databestand openen` to reconnect an existing file
+4. Give the app permission to read and write the file when your browser asks
+
+Once connected, the app will automatically save changes to that file.
 
 ## Build for production
 
@@ -199,7 +212,15 @@ Go to `Overzicht` to see:
 
 ## Backup and restore
 
-The app includes a local export/import flow.
+The app includes both direct file-based storage and a manual export/import flow.
+
+Recommended approach:
+
+1. Use the built-in local data file connection in `Instellingen`
+2. Keep working normally
+3. Let the app autosave to your chosen JSON file
+
+Manual backup is still available if you want extra copies.
 
 To export:
 

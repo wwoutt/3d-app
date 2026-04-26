@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Dexie from "dexie";
 import { Bar, BarChart, Tooltip, XAxis, YAxis } from "recharts";
 import packageJson from "../package.json";
@@ -38,6 +38,24 @@ const panelStyle = {
   background: "#1f2937",
 };
 
+const dataFilePickerOptions = {
+  id: "3d-print-manager-data",
+  suggestedName: "3d-print-manager-data.json",
+  types: [
+    {
+      description: "3D Print Manager data",
+      accept: {
+        "application/json": [".json"],
+      },
+    },
+  ],
+};
+
+const getFilePickerOptions = (startIn) => ({
+  ...dataFilePickerOptions,
+  ...(startIn ? { startIn } : {}),
+});
+
 // ---------- UI ----------
 const Btn = ({ children, style, ...props }) => (
   <button {...props} style={{ ...buttonBaseStyle, ...style }}>
@@ -76,6 +94,18 @@ db.version(7).stores({
   settings: "id",
 });
 
+db.version(8).stores({
+  materials: "++id,name",
+  colors: "++id,materialId,name,stock",
+  purchases: "++id,colorId,grams,price,date",
+  parts: "++id,name,category,stock",
+  partPurchases: "++id,partId,amount,price,date",
+  products: "++id,name,grams,printTime,workTime,link,image",
+  prints: "++id,productId,colorId,amount,sellingPrice,date",
+  settings: "id",
+  appMeta: "key",
+});
+
 // ---------- HELPERS ----------
 const avgPricePerKg = (purchases, colorId) => {
   const list = purchases.filter((purchase) => purchase.colorId == colorId);
@@ -87,9 +117,61 @@ const avgPricePerKg = (purchases, colorId) => {
 const getComponentCostPerUnit = (product) =>
   (product.components || []).reduce((sum, component) => sum + Number(component.cost || 0), 0);
 
-const calcCostBreakdown = (product, amount, pricePerKg, settings) => {
-  const grams = Number(product.grams || 0) * amount * (1 + (settings.waste || 0) / 100);
-  const filament = (grams / 1000) * pricePerKg;
+const normalizeFilamentUses = (filamentUses) =>
+  (filamentUses || [])
+    .filter((use) => use.colorId && Number(use.grams || 0) > 0)
+    .map((use) => ({
+      colorId: Number(use.colorId),
+      grams: Number(use.grams),
+    }));
+
+const getFilamentUsesForRecord = (record, product) => {
+  const normalized = normalizeFilamentUses(record?.filamentUses);
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  if (record?.colorId && Number(record?.grams ?? product?.grams ?? 0) > 0) {
+    return [
+      {
+        colorId: Number(record.colorId),
+        grams: Number(record.grams ?? product?.grams ?? 0),
+      },
+    ];
+  }
+
+  return [];
+};
+
+const calcFilamentBreakdown = (filamentUses, amount, purchases, settings) => {
+  const normalizedUses = normalizeFilamentUses(filamentUses);
+  const wasteFactor = 1 + (settings.waste || 0) / 100;
+
+  const entries = normalizedUses.map((use) => {
+    const gramsPerPrint = Number(use.grams || 0);
+    const gramsTotal = gramsPerPrint * amount * wasteFactor;
+    const pricePerKg = avgPricePerKg(purchases, use.colorId);
+    const cost = (gramsTotal / 1000) * pricePerKg;
+
+    return {
+      colorId: use.colorId,
+      gramsPerPrint,
+      gramsTotal,
+      pricePerKg,
+      cost,
+    };
+  });
+
+  return {
+    entries,
+    totalGrams: entries.reduce((sum, entry) => sum + entry.gramsTotal, 0),
+    totalCost: entries.reduce((sum, entry) => sum + entry.cost, 0),
+  };
+};
+
+const calcCostBreakdown = (product, amount, filamentUses, purchases, settings) => {
+  const filamentBreakdown = calcFilamentBreakdown(filamentUses, amount, purchases, settings);
+  const filament = filamentBreakdown.totalCost;
   const power =
     product.printTime < 2
       ? settings.powerLow
@@ -104,6 +186,8 @@ const calcCostBreakdown = (product, amount, pricePerKg, settings) => {
     parts,
     electricity,
     labor,
+    filamentEntries: filamentBreakdown.entries,
+    filamentGrams: filamentBreakdown.totalGrams,
     total: filament + parts + electricity + labor,
   };
 };
@@ -135,10 +219,23 @@ export default function App() {
   const [buy, setBuy] = useState({ colorId: "", grams: 0, price: 0 });
   const [partForm, setPartForm] = useState({ name: "", category: "" });
   const [partBuy, setPartBuy] = useState({ partId: "", amount: 1, price: 0 });
-  const [prod, setProd] = useState({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
+  const [prod, setProd] = useState({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
   const [editProduct, setEditProduct] = useState(null);
-  const [run, setRun] = useState({ productId: "", colorId: "", amount: 1, sellingPrice: 0 });
+  const [run, setRun] = useState({ productId: "", amount: 1, sellingPrice: 0, filamentUses: [] });
   const [componentForm, setComponentForm] = useState({ name: "", cost: 0 });
+  const [filamentForm, setFilamentForm] = useState({ colorId: "", grams: 0 });
+  const [dataFileHandle, setDataFileHandle] = useState(null);
+  const [dataFileName, setDataFileName] = useState("");
+  const [fileStorageReady, setFileStorageReady] = useState(false);
+
+  const initializedRef = useRef(false);
+  const autosaveInFlightRef = useRef(false);
+  const autosaveQueuedRef = useRef(false);
+
+  const supportsFileStorage =
+    typeof window !== "undefined" &&
+    typeof window.showOpenFilePicker === "function" &&
+    typeof window.showSaveFilePicker === "function";
 
   const showToast = (message, success = true) => {
     setToast({ message, success });
@@ -146,15 +243,203 @@ export default function App() {
     showToast.timeoutId = window.setTimeout(() => setToast(null), 2000);
   };
 
+  const collectDataSnapshot = async () => ({
+    schemaVersion: 1,
+    appVersion: APP_VERSION,
+    updatedAt: new Date().toISOString(),
+    materials: await db.materials.toArray(),
+    colors: await db.colors.toArray(),
+    purchases: await db.purchases.toArray(),
+    parts: await db.parts.toArray(),
+    partPurchases: await db.partPurchases.toArray(),
+    products: await db.products.toArray(),
+    prints: await db.prints.toArray(),
+    settings: [{ ...settings, id: 1 }],
+  });
+
+  async function replaceDataFromSnapshot(snapshot) {
+    const safeSnapshot = {
+      materials: Array.isArray(snapshot.materials) ? snapshot.materials : [],
+      colors: Array.isArray(snapshot.colors) ? snapshot.colors : [],
+      purchases: Array.isArray(snapshot.purchases) ? snapshot.purchases : [],
+      parts: Array.isArray(snapshot.parts) ? snapshot.parts : [],
+      partPurchases: Array.isArray(snapshot.partPurchases) ? snapshot.partPurchases : [],
+      products: Array.isArray(snapshot.products) ? snapshot.products : [],
+      prints: Array.isArray(snapshot.prints) ? snapshot.prints : [],
+      settings: Array.isArray(snapshot.settings) ? snapshot.settings : [],
+    };
+
+    await db.transaction(
+      "rw",
+      db.materials,
+      db.colors,
+      db.purchases,
+      db.parts,
+      db.partPurchases,
+      db.products,
+      db.prints,
+      db.settings,
+      async () => {
+        await db.materials.clear();
+        await db.colors.clear();
+        await db.purchases.clear();
+        await db.parts.clear();
+        await db.partPurchases.clear();
+        await db.products.clear();
+        await db.prints.clear();
+        await db.settings.clear();
+
+        if (safeSnapshot.materials.length) await db.materials.bulkPut(safeSnapshot.materials);
+        if (safeSnapshot.colors.length) await db.colors.bulkPut(safeSnapshot.colors);
+        if (safeSnapshot.purchases.length) await db.purchases.bulkPut(safeSnapshot.purchases);
+        if (safeSnapshot.parts.length) await db.parts.bulkPut(safeSnapshot.parts);
+        if (safeSnapshot.partPurchases.length) await db.partPurchases.bulkPut(safeSnapshot.partPurchases);
+        if (safeSnapshot.products.length) await db.products.bulkPut(safeSnapshot.products);
+        if (safeSnapshot.prints.length) await db.prints.bulkPut(safeSnapshot.prints);
+        if (safeSnapshot.settings.length) await db.settings.bulkPut(safeSnapshot.settings);
+      },
+    );
+  }
+
+  async function storeDataFileHandle(handle) {
+    await db.appMeta.put({ key: "dataFileHandle", value: handle });
+    setDataFileHandle(handle);
+    setDataFileName(handle?.name || "");
+    setFileStorageReady(Boolean(handle));
+  }
+
+  async function clearStoredDataFileHandle() {
+    if (db.appMeta) {
+      await db.appMeta.delete("dataFileHandle");
+    }
+    setDataFileHandle(null);
+    setDataFileName("");
+    setFileStorageReady(false);
+  }
+
+  async function ensureFilePermission(handle) {
+    if (!handle) {
+      return false;
+    }
+
+    const permissionOptions = { mode: "readwrite" };
+
+    if ((await handle.queryPermission(permissionOptions)) === "granted") {
+      return true;
+    }
+
+    return (await handle.requestPermission(permissionOptions)) === "granted";
+  }
+
+  async function writeSnapshotToFile(handle, snapshot) {
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(snapshot, null, 2));
+    await writable.close();
+  }
+
+  async function saveBoundFileNow(showSuccessToast = false) {
+    if (!dataFileHandle) {
+      return false;
+    }
+
+    if (!(await ensureFilePermission(dataFileHandle))) {
+      setFileStorageReady(false);
+      showToast("Geen schrijfrechten voor databestand", false);
+      return false;
+    }
+
+    const snapshot = await collectDataSnapshot();
+    await writeSnapshotToFile(dataFileHandle, snapshot);
+    setFileStorageReady(true);
+
+    if (showSuccessToast) {
+      showToast("Databestand opgeslagen");
+    }
+
+    return true;
+  }
+
+  async function flushAutosaveQueue() {
+    if (!dataFileHandle || autosaveInFlightRef.current) {
+      return;
+    }
+
+    autosaveInFlightRef.current = true;
+
+    try {
+      await saveBoundFileNow(false);
+    } catch {
+      showToast("Automatisch opslaan mislukt", false);
+    } finally {
+      autosaveInFlightRef.current = false;
+      if (autosaveQueuedRef.current) {
+        autosaveQueuedRef.current = false;
+        void flushAutosaveQueue();
+      }
+    }
+  }
+
+  async function attachFileHandle(handle, loadFromFile) {
+    if (!(await ensureFilePermission(handle))) {
+      showToast("Toegang tot databestand geweigerd", false);
+      return false;
+    }
+
+    if (loadFromFile) {
+      const file = await handle.getFile();
+      const text = await file.text();
+      if (text.trim()) {
+        const snapshot = JSON.parse(text);
+        await replaceDataFromSnapshot(snapshot);
+      }
+    } else {
+      const snapshot = await collectDataSnapshot();
+      await writeSnapshotToFile(handle, snapshot);
+    }
+
+    await storeDataFileHandle(handle);
+    await mergeDuplicateMaterials();
+    await loadSettings();
+    await loadAll();
+    initializedRef.current = true;
+    return true;
+  }
+
   useEffect(() => {
     async function init() {
+      if (supportsFileStorage && db.appMeta) {
+        const storedHandle = await db.appMeta.get("dataFileHandle");
+        if (storedHandle?.value) {
+          try {
+            await attachFileHandle(storedHandle.value, true);
+          } catch {
+            await clearStoredDataFileHandle();
+            showToast("Kon eerder databestand niet automatisch openen", false);
+          }
+        }
+      }
+
       await mergeDuplicateMaterials();
       await loadSettings();
       await loadAll();
+      initializedRef.current = true;
     }
 
     init();
+    // This effect boots the app once and restores a previously linked data file when possible.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!initializedRef.current || !dataFileHandle) {
+      return;
+    }
+
+    autosaveQueuedRef.current = true;
+    void flushAutosaveQueue();
+    // Autosave is intentionally driven by the latest loaded state plus the active file binding.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [materials, colors, purchases, parts, partPurchases, products, prints, settings, dataFileHandle]);
 
   async function loadAll() {
     setMaterials(await db.materials.toArray());
@@ -203,17 +488,7 @@ export default function App() {
 
   // ---------- BACKUP ----------
   const exportData = async () => {
-    const data = {
-      materials: await db.materials.toArray(),
-      colors: await db.colors.toArray(),
-      purchases: await db.purchases.toArray(),
-      parts: await db.parts.toArray(),
-      partPurchases: await db.partPurchases.toArray(),
-      products: await db.products.toArray(),
-      prints: await db.prints.toArray(),
-      settings: [{ ...settings, id: 1 }],
-    };
-
+    const data = await collectDataSnapshot();
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -233,13 +508,7 @@ export default function App() {
     try {
       const text = await file.text();
       const data = JSON.parse(text);
-
-      for (const key of Object.keys(data)) {
-        if (!db[key] || !Array.isArray(data[key])) {
-          continue;
-        }
-        await db[key].bulkPut(data[key]);
-      }
+      await replaceDataFromSnapshot(data);
 
       await loadSettings();
       await loadAll();
@@ -249,6 +518,76 @@ export default function App() {
     } finally {
       event.target.value = "";
     }
+  };
+
+  const createLocalDataFile = async () => {
+    if (!supportsFileStorage) {
+      showToast("Bestandsopslag wordt niet ondersteund in deze browser", false);
+      return;
+    }
+
+    try {
+      const handle = await window.showSaveFilePicker(dataFilePickerOptions);
+      const connected = await attachFileHandle(handle, false);
+      if (connected) {
+        showToast("Nieuw lokaal databestand gekoppeld");
+      }
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        showToast("Aanmaken van databestand mislukt", false);
+      }
+    }
+  };
+
+  const openExistingDataFile = async () => {
+    if (!supportsFileStorage) {
+      showToast("Bestandsopslag wordt niet ondersteund in deze browser", false);
+      return;
+    }
+
+    try {
+      const [handle] = await window.showOpenFilePicker(getFilePickerOptions(dataFileHandle || "documents"));
+      if (!handle) {
+        return;
+      }
+
+      const connected = await attachFileHandle(handle, true);
+      if (connected) {
+        showToast("Bestaand databestand geladen");
+      }
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        showToast("Openen van databestand mislukt", false);
+      }
+    }
+  };
+
+  const reopenCurrentDataFile = async () => {
+    if (!supportsFileStorage) {
+      showToast("Bestandsopslag wordt niet ondersteund in deze browser", false);
+      return;
+    }
+
+    try {
+      const [handle] = await window.showOpenFilePicker(getFilePickerOptions(dataFileHandle || "documents"));
+      if (!handle) {
+        return;
+      }
+
+      const connected = await attachFileHandle(handle, true);
+      if (connected) {
+        showToast("Databestand opnieuw geopend");
+      }
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        showToast("Opnieuw openen van databestand mislukt", false);
+      }
+    }
+  };
+
+  const disconnectDataFile = async () => {
+    await clearStoredDataFileHandle();
+    showToast("Bestandskoppeling losgekoppeld");
   };
 
   // ---------- CRUD ----------
@@ -404,7 +743,6 @@ export default function App() {
     const payload = {
       ...prod,
       name: prod.name.trim(),
-      grams: Number(prod.grams),
       printTime: Number(prod.printTime),
       workTime: Number(prod.workTime),
       link: prod.link.trim(),
@@ -427,7 +765,7 @@ export default function App() {
       showToast("Product toegevoegd");
     }
 
-    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
+    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
     setComponentForm({ name: "", cost: 0 });
     await loadAll();
   };
@@ -436,6 +774,7 @@ export default function App() {
     setEditProduct(product);
     setProd({
       ...product,
+      grams: undefined,
       components: (product.components || []).map((component) => ({
         id: component.id || crypto.randomUUID(),
         name: component.name || "",
@@ -453,28 +792,37 @@ export default function App() {
   };
 
   const addPrint = async () => {
-    if (!run.productId || !run.colorId || !run.amount) {
-      showToast("Kies product, kleur en aantal", false);
+    const filamentUses = normalizeFilamentUses(run.filamentUses);
+
+    if (!run.productId || !run.amount || filamentUses.length === 0) {
+      showToast("Kies product, aantal en filamentgebruik", false);
       return;
     }
 
     const product = products.find((entry) => entry.id == run.productId);
-    const color = colors.find((entry) => entry.id == run.colorId);
 
     await db.prints.add({
       ...run,
       productId: Number(run.productId),
-      colorId: Number(run.colorId),
       amount: Number(run.amount),
       sellingPrice: Number(run.sellingPrice),
+      filamentUses,
       date: new Date(),
     });
 
-    if (color && product) {
-      await db.colors.update(color.id, { stock: Number(color.stock || 0) - Number(product.grams || 0) * Number(run.amount) });
+    if (product) {
+      const wasteFactor = 1 + (settings.waste || 0) / 100;
+      for (const use of filamentUses) {
+        const color = colors.find((entry) => entry.id == use.colorId);
+        if (color) {
+          const usedGrams = Number(use.grams || 0) * Number(run.amount) * wasteFactor;
+          await db.colors.update(color.id, { stock: Number(color.stock || 0) - usedGrams });
+        }
+      }
     }
 
-    setRun({ productId: "", colorId: "", amount: 1, sellingPrice: 0 });
+    setRun({ productId: "", amount: 1, sellingPrice: 0, filamentUses: [] });
+    setFilamentForm({ colorId: "", grams: 0 });
     await loadAll();
     showToast("Print opgeslagen");
   };
@@ -520,16 +868,48 @@ export default function App() {
     }));
   };
 
+  const addFilamentUseToPrint = () => {
+    const colorId = Number(filamentForm.colorId);
+    const grams = Number(filamentForm.grams);
+
+    if (!colorId || grams <= 0) {
+      showToast("Kies een kleur en geef gramverbruik op", false);
+      return;
+    }
+
+    setRun((current) => ({
+      ...current,
+      filamentUses: [...(current.filamentUses || []), { id: crypto.randomUUID(), colorId, grams }],
+    }));
+    setFilamentForm({ colorId: "", grams: 0 });
+  };
+
+  const removeFilamentUseFromPrint = (filamentUseId) => {
+    setRun((current) => ({
+      ...current,
+      filamentUses: (current.filamentUses || []).filter((use) => use.id !== filamentUseId),
+    }));
+  };
+
   // ---------- LIVE ----------
   const live = useMemo(() => {
     const product = products.find((entry) => entry.id == run.productId);
-    const pricePerKg = avgPricePerKg(purchases, run.colorId);
 
     if (!product) {
-      return { filament: 0, parts: 0, electricity: 0, labor: 0, cost: 0, revenue: 0, profit: 0, suggested: 0 };
+      return {
+        filament: 0,
+        parts: 0,
+        electricity: 0,
+        labor: 0,
+        cost: 0,
+        revenue: 0,
+        profit: 0,
+        suggested: 0,
+        filamentEntries: [],
+      };
     }
 
-    const breakdown = calcCostBreakdown(product, Number(run.amount || 0), pricePerKg, settings);
+    const breakdown = calcCostBreakdown(product, Number(run.amount || 0), run.filamentUses, purchases, settings);
     const revenue = Number(run.sellingPrice || 0) * Number(run.amount || 0);
     const suggested = breakdown.total * (1 + (settings.margin || 30) / 100);
 
@@ -546,13 +926,13 @@ export default function App() {
   const printAnalytics = prints
     .map((print) => {
       const product = products.find((entry) => entry.id == print.productId);
-      const pricePerKg = avgPricePerKg(purchases, print.colorId);
 
       if (!product) {
         return null;
       }
 
-      const costBreakdown = calcCostBreakdown(product, Number(print.amount), pricePerKg, settings);
+      const filamentUses = getFilamentUsesForRecord(print, product);
+      const costBreakdown = calcCostBreakdown(product, Number(print.amount), filamentUses, purchases, settings);
       const revenue = Number(print.sellingPrice) * Number(print.amount);
       const profit = revenue - costBreakdown.total;
       return {
@@ -819,7 +1199,6 @@ export default function App() {
         {tab === "products" && (
           <Box>
             <In label="Naam" value={prod.name} onChange={(event) => setProd({ ...prod, name: event.target.value })} />
-            <In label="Gram" type="number" value={prod.grams} onChange={(event) => setProd({ ...prod, grams: event.target.value })} />
             <In
               label="Printtijd"
               type="number"
@@ -889,7 +1268,7 @@ export default function App() {
                   style={{ background: "#4b5563" }}
                   onClick={() => {
                     setEditProduct(null);
-                    setProd({ name: "", grams: 0, printTime: 0, workTime: 0, link: "", image: "", components: [] });
+                    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
                     setComponentForm({ name: "", cost: 0 });
                   }}
                 >
@@ -919,7 +1298,7 @@ export default function App() {
                   )}
                   <div style={{ fontWeight: "bold", marginBottom: 6 }}>{product.name}</div>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>
-                    {product.grams}g | {product.printTime}u | {product.workTime}u werk
+                    {product.printTime}u | {product.workTime}u werk
                   </div>
                   <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
                     Onderdelen: EUR {getComponentCostPerUnit(product).toFixed(2)} per stuk
@@ -956,25 +1335,6 @@ export default function App() {
               ))}
             </select>
 
-            <select
-              value={run.colorId}
-              onChange={(event) => setRun({ ...run, colorId: event.target.value })}
-              style={selectStyle}
-            >
-              <option value="">Kleur</option>
-              {materials.map((material) => (
-                <optgroup key={material.id} label={material.name}>
-                  {colors
-                    .filter((color) => color.materialId == material.id)
-                    .map((color) => (
-                      <option key={color.id} value={color.id}>
-                        {color.name}
-                      </option>
-                    ))}
-                </optgroup>
-              ))}
-            </select>
-
             <In
               label="Aantal"
               type="number"
@@ -987,6 +1347,81 @@ export default function App() {
               value={run.sellingPrice}
               onChange={(event) => setRun({ ...run, sellingPrice: Number(event.target.value) })}
             />
+
+            <h3>Filamentgebruik per print</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(120px, 1fr) auto", gap: 10, alignItems: "end" }}>
+              <div>
+                <label style={{ display: "block", marginBottom: 6 }}>Kleur</label>
+                <select
+                  value={filamentForm.colorId}
+                  onChange={(event) => setFilamentForm({ ...filamentForm, colorId: event.target.value })}
+                  style={selectStyle}
+                >
+                  <option value="">Kies kleur</option>
+                  {materials.map((material) => (
+                    <optgroup key={material.id} label={material.name}>
+                      {colors
+                        .filter((color) => color.materialId == material.id)
+                        .map((color) => (
+                          <option key={color.id} value={color.id}>
+                            {color.name}
+                          </option>
+                        ))}
+                    </optgroup>
+                  ))}
+                </select>
+              </div>
+              <In
+                label="Gram per print"
+                type="number"
+                value={filamentForm.grams}
+                onChange={(event) => setFilamentForm({ ...filamentForm, grams: Number(event.target.value) })}
+              />
+              <Btn onClick={addFilamentUseToPrint}>Kleur toevoegen</Btn>
+            </div>
+
+            {(run.filamentUses || []).length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                {(run.filamentUses || []).map((use) => {
+                  const color = colors.find((entry) => entry.id == use.colorId);
+                  return (
+                    <div
+                      key={use.id}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 10,
+                        padding: 10,
+                        marginBottom: 8,
+                        borderRadius: 8,
+                        background: "#111827",
+                      }}
+                    >
+                      <span>
+                        {color?.name || "Onbekende kleur"} - {Number(use.grams || 0).toFixed(2)}g per print
+                      </span>
+                      <Btn style={{ background: "#dc2626" }} onClick={() => removeFilamentUseFromPrint(use.id)}>
+                        Verwijderen
+                      </Btn>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {live.filamentEntries.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                {live.filamentEntries.map((entry) => {
+                  const color = colors.find((item) => item.id == entry.colorId);
+                  return (
+                    <p key={`live-filament-${entry.colorId}`} style={{ margin: "4px 0" }}>
+                      {color?.name || "Onbekende kleur"}: {entry.gramsTotal.toFixed(2)}g totaal - EUR {entry.cost.toFixed(2)}
+                    </p>
+                  );
+                })}
+              </div>
+            )}
 
             <p>Filament: EUR {live.filament.toFixed(2)}</p>
             <p>Onderdelen: EUR {live.parts.toFixed(2)}</p>
@@ -1061,6 +1496,37 @@ export default function App() {
 
         {tab === "settings" && (
           <Box>
+            <h4>Lokale bestandsopslag</h4>
+            <p style={{ lineHeight: 1.5 }}>
+              Koppel deze app aan een lokaal JSON-bestand. Daarna worden je gegevens automatisch daarin opgeslagen en kun je
+              hetzelfde bestand later opnieuw openen, ook als browseropslag wordt gewist.
+            </p>
+            <p style={{ opacity: 0.8 }}>
+              Status: {dataFileHandle ? `gekoppeld aan ${dataFileName || "databestand"}` : "nog geen databestand gekoppeld"}
+              {dataFileHandle ? ` (${fileStorageReady ? "gereed" : "toestemming vereist"})` : ""}
+            </p>
+            <p style={{ opacity: 0.7, lineHeight: 1.5 }}>
+              Vanwege browserbeveiliging kan de app je bestandsmap niet direct openen in Verkenner. Je kunt hieronder wel
+              snel hetzelfde databestand opnieuw kiezen.
+            </p>
+            <div style={{ marginBottom: 16 }}>
+              <Btn onClick={createLocalDataFile}>Nieuw databestand</Btn>
+              <Btn onClick={openExistingDataFile}>Bestaand databestand openen</Btn>
+              {dataFileHandle && <Btn onClick={reopenCurrentDataFile}>Huidig databestand opnieuw kiezen</Btn>}
+              {dataFileHandle && <Btn onClick={() => void saveBoundFileNow(true)}>Nu opslaan</Btn>}
+              {dataFileHandle && (
+                <Btn style={{ background: "#4b5563" }} onClick={disconnectDataFile}>
+                  Koppeling verwijderen
+                </Btn>
+              )}
+            </div>
+            {!supportsFileStorage && (
+              <p style={{ color: "#fca5a5" }}>
+                Deze browser ondersteunt geen directe bestandsopslag. Gebruik in dat geval handmatig export/import.
+              </p>
+            )}
+
+            <h4>Kostinstellingen</h4>
             <In
               label="Stroomprijs"
               type="number"
@@ -1105,7 +1571,7 @@ export default function App() {
             />
             <Btn onClick={saveSettings}>Opslaan</Btn>
 
-            <h4>Backup</h4>
+            <h4>Handmatige backup</h4>
             <Btn onClick={exportData}>Export</Btn>
             <input type="file" accept="application/json" onChange={importData} style={{ display: "block", marginTop: 10 }} />
           </Box>
