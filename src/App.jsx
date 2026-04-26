@@ -1,8 +1,9 @@
-// VERSION: v1.4.2
-
 import { useEffect, useMemo, useState } from "react";
 import Dexie from "dexie";
 import { Bar, BarChart, Tooltip, XAxis, YAxis } from "recharts";
+import packageJson from "../package.json";
+
+const APP_VERSION = packageJson.version;
 
 const buttonBaseStyle = {
   margin: 6,
@@ -624,6 +625,7 @@ export default function App() {
 
       <div style={{ minHeight: "100vh", padding: 20, background: "#111827", color: "white" }}>
         <h1 style={{ marginTop: 0 }}>3D Print Manager</h1>
+        <p style={{ marginTop: -8, marginBottom: 16, opacity: 0.7 }}>Versie {APP_VERSION}</p>
 
         <div style={{ marginBottom: 16 }}>
           <Btn onClick={() => setTab("materials")}>Materialen</Btn>
