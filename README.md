@@ -116,6 +116,16 @@ After the app opens:
 
 Once connected, the app will automatically save changes to that file.
 
+### 6. Optional: choose a snapshot folder
+
+You can also choose a separate local folder for automatic snapshot versions.
+
+1. Go to `Instellingen`
+2. Click `Snapshotmap kiezen`
+3. Select a folder on your computer
+
+The app can then create timestamped backup versions in that folder while you work.
+
 ## Build for production
 
 If you want to create a production build:
@@ -218,7 +228,8 @@ Recommended approach:
 
 1. Use the built-in local data file connection in `Instellingen`
 2. Keep working normally
-3. Let the app autosave to your chosen JSON file
+3. Optionally connect a snapshot folder for versioned backups
+4. Let the app autosave to your chosen JSON file
 
 Manual backup is still available if you want extra copies.
 

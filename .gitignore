@@ -11,6 +11,8 @@ node_modules
 dist
 dist-ssr
 *.local
+3d-print-manager-data.json
+3d-print-manager-snapshot-*.json
 
 # Editor directories and files
 .vscode/*

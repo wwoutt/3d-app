@@ -56,6 +56,9 @@ const getFilePickerOptions = (startIn) => ({
   ...(startIn ? { startIn } : {}),
 });
 
+const AUTO_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_SNAPSHOT_FILES = 20;
+
 // ---------- UI ----------
 const Btn = ({ children, style, ...props }) => (
   <button {...props} style={{ ...buttonBaseStyle, ...style }}>
@@ -102,6 +105,18 @@ db.version(8).stores({
   partPurchases: "++id,partId,amount,price,date",
   products: "++id,name,grams,printTime,workTime,link,image",
   prints: "++id,productId,colorId,amount,sellingPrice,date",
+  settings: "id",
+  appMeta: "key",
+});
+
+db.version(9).stores({
+  materials: "++id,name",
+  colors: "++id,materialId,name,stock",
+  purchases: "++id,colorId,grams,price,date",
+  parts: "++id,name,category,stock",
+  partPurchases: "++id,partId,amount,price,date",
+  products: "++id,name,printTime,workTime,link,image",
+  prints: "++id,productId,printerId,amount,sellingPrice,date",
   settings: "id",
   appMeta: "key",
 });
@@ -169,26 +184,166 @@ const calcFilamentBreakdown = (filamentUses, amount, purchases, settings) => {
   };
 };
 
-const calcCostBreakdown = (product, amount, filamentUses, purchases, settings) => {
+const calcCostBreakdown = (product, amount, filamentUses, purchases, settings, printerId) => {
   const filamentBreakdown = calcFilamentBreakdown(filamentUses, amount, purchases, settings);
   const filament = filamentBreakdown.totalCost;
+  const printer =
+    (settings.printers || []).find((entry) => entry.id == printerId) ||
+    settings.printers?.[0] || {
+      name: "Default printer",
+      powerLow: settings.powerLow,
+      powerMid: settings.powerMid,
+      powerHigh: settings.powerHigh,
+    };
   const power =
     product.printTime < 2
-      ? settings.powerLow
+      ? printer.powerLow
       : product.printTime < 6
-        ? settings.powerMid
-        : settings.powerHigh;
+        ? printer.powerMid
+        : printer.powerHigh;
   const electricity = (power / 1000) * (Number(product.printTime || 0) * amount) * settings.electricityPrice;
   const labor = Number(product.workTime || 0) * amount * settings.hourlyRate;
   const parts = getComponentCostPerUnit(product) * amount;
+  const perOrderOverhead = (settings.overheads || [])
+    .filter((entry) => entry.mode === "perOrder")
+    .reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const perPrintDepreciation = (settings.depreciations || [])
+    .filter((entry) => entry.mode === "perPrint")
+    .reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const perHourDepreciation = (settings.depreciations || [])
+    .filter((entry) => entry.mode === "perHour")
+    .reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const overhead = perOrderOverhead * amount;
+  const depreciation = perPrintDepreciation * amount + perHourDepreciation * Number(product.printTime || 0) * amount;
   return {
     filament,
     parts,
     electricity,
     labor,
+    overhead,
+    depreciation,
+    printerName: printer?.name || "",
     filamentEntries: filamentBreakdown.entries,
     filamentGrams: filamentBreakdown.totalGrams,
-    total: filament + parts + electricity + labor,
+    total: filament + parts + electricity + labor + overhead + depreciation,
+  };
+};
+
+const startOfToday = () => {
+  const value = new Date();
+  value.setHours(0, 0, 0, 0);
+  return value;
+};
+
+const startOfWeek = () => {
+  const value = startOfToday();
+  const day = value.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  value.setDate(value.getDate() + diff);
+  return value;
+};
+
+const startOfMonth = () => {
+  const value = startOfToday();
+  value.setDate(1);
+  return value;
+};
+
+const startOfYear = () => {
+  const value = startOfToday();
+  value.setMonth(0, 1);
+  return value;
+};
+
+const endOfToday = () => {
+  const value = new Date();
+  value.setHours(23, 59, 59, 999);
+  return value;
+};
+
+const getDateRangeForPreset = (preset, customFrom, customTo) => {
+  if (preset === "custom") {
+    return {
+      from: customFrom ? new Date(`${customFrom}T00:00:00`) : null,
+      to: customTo ? new Date(`${customTo}T23:59:59.999`) : null,
+    };
+  }
+
+  if (preset === "today") {
+    return { from: startOfToday(), to: endOfToday() };
+  }
+
+  if (preset === "week") {
+    return { from: startOfWeek(), to: endOfToday() };
+  }
+
+  if (preset === "month") {
+    return { from: startOfMonth(), to: endOfToday() };
+  }
+
+  if (preset === "year") {
+    return { from: startOfYear(), to: endOfToday() };
+  }
+
+  return { from: null, to: null };
+};
+
+const isWithinDateRange = (value, from, to) => {
+  const dateValue = new Date(value);
+  if (from && dateValue < from) {
+    return false;
+  }
+  if (to && dateValue > to) {
+    return false;
+  }
+  return true;
+};
+
+const normalizeSettings = (storedSettings) => {
+  const basePrinters =
+    Array.isArray(storedSettings?.printers) && storedSettings.printers.length > 0
+      ? storedSettings.printers.map((printer) => ({
+          id: printer.id || crypto.randomUUID(),
+          name: printer.name || "Unnamed printer",
+          powerLow: Number(printer.powerLow ?? storedSettings.powerLow ?? 150),
+          powerMid: Number(printer.powerMid ?? storedSettings.powerMid ?? 180),
+          powerHigh: Number(printer.powerHigh ?? storedSettings.powerHigh ?? 220),
+        }))
+      : [
+          {
+            id: "default-printer",
+            name: "Default printer",
+            powerLow: Number(storedSettings?.powerLow ?? 150),
+            powerMid: Number(storedSettings?.powerMid ?? 180),
+            powerHigh: Number(storedSettings?.powerHigh ?? 220),
+          },
+        ];
+
+  return {
+    electricityPrice: Number(storedSettings?.electricityPrice ?? 0.3),
+    hourlyRate: Number(storedSettings?.hourlyRate ?? 15),
+    powerLow: Number(storedSettings?.powerLow ?? basePrinters[0].powerLow ?? 150),
+    powerMid: Number(storedSettings?.powerMid ?? basePrinters[0].powerMid ?? 180),
+    powerHigh: Number(storedSettings?.powerHigh ?? basePrinters[0].powerHigh ?? 220),
+    margin: Number(storedSettings?.margin ?? 30),
+    waste: Number(storedSettings?.waste ?? 5),
+    printers: basePrinters,
+    overheads: Array.isArray(storedSettings?.overheads)
+      ? storedSettings.overheads.map((entry) => ({
+          id: entry.id || crypto.randomUUID(),
+          name: entry.name || "Unnamed overhead",
+          amount: Number(entry.amount || 0),
+          mode: entry.mode === "perOrder" ? "perOrder" : "monthly",
+        }))
+      : [],
+    depreciations: Array.isArray(storedSettings?.depreciations)
+      ? storedSettings.depreciations.map((entry) => ({
+          id: entry.id || crypto.randomUUID(),
+          name: entry.name || "Unnamed depreciation",
+          amount: Number(entry.amount || 0),
+          mode: entry.mode === "perHour" ? "perHour" : "perPrint",
+        }))
+      : [],
   };
 };
 
@@ -212,30 +367,59 @@ export default function App() {
     powerHigh: 220,
     margin: 30,
     waste: 5,
+    printers: [
+      {
+        id: "default-printer",
+        name: "Default printer",
+        powerLow: 150,
+        powerMid: 180,
+        powerHigh: 220,
+      },
+    ],
+    overheads: [],
+    depreciations: [],
   });
 
   const [mName, setMName] = useState("");
   const [cForm, setCForm] = useState({ name: "", materialId: "" });
-  const [buy, setBuy] = useState({ colorId: "", grams: 0, price: 0 });
+  const [buy, setBuy] = useState({ colorId: "", grams: 0, price: 0, notes: "" });
   const [partForm, setPartForm] = useState({ name: "", category: "" });
-  const [partBuy, setPartBuy] = useState({ partId: "", amount: 1, price: 0 });
-  const [prod, setProd] = useState({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
+  const [partBuy, setPartBuy] = useState({ partId: "", amount: 1, price: 0, notes: "" });
+  const [prod, setProd] = useState({ name: "", printTime: 0, workTime: 0, link: "", image: "", notes: "", components: [] });
   const [editProduct, setEditProduct] = useState(null);
-  const [run, setRun] = useState({ productId: "", amount: 1, sellingPrice: 0, filamentUses: [] });
+  const [run, setRun] = useState({ productId: "", printerId: "default-printer", amount: 1, sellingPrice: 0, notes: "", filamentUses: [] });
   const [componentForm, setComponentForm] = useState({ name: "", cost: 0 });
   const [filamentForm, setFilamentForm] = useState({ colorId: "", grams: 0 });
   const [dataFileHandle, setDataFileHandle] = useState(null);
   const [dataFileName, setDataFileName] = useState("");
   const [fileStorageReady, setFileStorageReady] = useState(false);
+  const [backupDirectoryHandle, setBackupDirectoryHandle] = useState(null);
+  const [backupDirectoryName, setBackupDirectoryName] = useState("");
+  const [printerForm, setPrinterForm] = useState({ name: "", powerLow: 150, powerMid: 180, powerHigh: 220 });
+  const [overheadForm, setOverheadForm] = useState({ name: "", amount: 0, mode: "monthly" });
+  const [depreciationForm, setDepreciationForm] = useState({ name: "", amount: 0, mode: "perPrint" });
+  const [searchMaterials, setSearchMaterials] = useState("");
+  const [searchParts, setSearchParts] = useState("");
+  const [searchProducts, setSearchProducts] = useState("");
+  const [overviewPeriod, setOverviewPeriod] = useState("month");
+  const [overviewFrom, setOverviewFrom] = useState("");
+  const [overviewTo, setOverviewTo] = useState("");
+  const [timelineTypeFilter, setTimelineTypeFilter] = useState("all");
+  const [timelineProductFilter, setTimelineProductFilter] = useState("");
+  const [timelineMaterialFilter, setTimelineMaterialFilter] = useState("");
+  const [timelineMonthFilter, setTimelineMonthFilter] = useState("");
 
   const initializedRef = useRef(false);
   const autosaveInFlightRef = useRef(false);
   const autosaveQueuedRef = useRef(false);
+  const lastSnapshotAtRef = useRef(0);
 
   const supportsFileStorage =
     typeof window !== "undefined" &&
     typeof window.showOpenFilePicker === "function" &&
     typeof window.showSaveFilePicker === "function";
+  const supportsDirectoryStorage =
+    typeof window !== "undefined" && typeof window.showDirectoryPicker === "function";
 
   const showToast = (message, success = true) => {
     setToast({ message, success });
@@ -317,7 +501,35 @@ export default function App() {
     setFileStorageReady(false);
   }
 
+  async function storeBackupDirectoryHandle(handle) {
+    await db.appMeta.put({ key: "backupDirectoryHandle", value: handle });
+    setBackupDirectoryHandle(handle);
+    setBackupDirectoryName(handle?.name || "");
+  }
+
+  async function clearStoredBackupDirectoryHandle() {
+    if (db.appMeta) {
+      await db.appMeta.delete("backupDirectoryHandle");
+    }
+    setBackupDirectoryHandle(null);
+    setBackupDirectoryName("");
+  }
+
   async function ensureFilePermission(handle) {
+    if (!handle) {
+      return false;
+    }
+
+    const permissionOptions = { mode: "readwrite" };
+
+    if ((await handle.queryPermission(permissionOptions)) === "granted") {
+      return true;
+    }
+
+    return (await handle.requestPermission(permissionOptions)) === "granted";
+  }
+
+  async function ensureDirectoryPermission(handle) {
     if (!handle) {
       return false;
     }
@@ -335,6 +547,53 @@ export default function App() {
     const writable = await handle.createWritable();
     await writable.write(JSON.stringify(snapshot, null, 2));
     await writable.close();
+  }
+
+  function buildSnapshotFileName() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return `3d-print-manager-snapshot-${timestamp}.json`;
+  }
+
+  async function pruneOldSnapshots(directoryHandle) {
+    const snapshotEntries = [];
+
+    for await (const entry of directoryHandle.values()) {
+      if (entry.kind === "file" && entry.name.startsWith("3d-print-manager-snapshot-") && entry.name.endsWith(".json")) {
+        snapshotEntries.push(entry.name);
+      }
+    }
+
+    snapshotEntries.sort();
+
+    while (snapshotEntries.length > MAX_SNAPSHOT_FILES) {
+      const oldest = snapshotEntries.shift();
+      if (oldest) {
+        await directoryHandle.removeEntry(oldest);
+      }
+    }
+  }
+
+  async function saveSnapshotToDirectory(showSuccessToast = false) {
+    if (!backupDirectoryHandle) {
+      return false;
+    }
+
+    if (!(await ensureDirectoryPermission(backupDirectoryHandle))) {
+      showToast("Geen schrijfrechten voor snapshotmap", false);
+      return false;
+    }
+
+    const snapshot = await collectDataSnapshot();
+    const fileHandle = await backupDirectoryHandle.getFileHandle(buildSnapshotFileName(), { create: true });
+    await writeSnapshotToFile(fileHandle, snapshot);
+    await pruneOldSnapshots(backupDirectoryHandle);
+    lastSnapshotAtRef.current = Date.now();
+
+    if (showSuccessToast) {
+      showToast("Snapshot opgeslagen");
+    }
+
+    return true;
   }
 
   async function saveBoundFileNow(showSuccessToast = false) {
@@ -368,6 +627,9 @@ export default function App() {
 
     try {
       await saveBoundFileNow(false);
+      if (backupDirectoryHandle && Date.now() - lastSnapshotAtRef.current >= AUTO_SNAPSHOT_INTERVAL_MS) {
+        await saveSnapshotToDirectory(false);
+      }
     } catch {
       showToast("Automatisch opslaan mislukt", false);
     } finally {
@@ -419,6 +681,17 @@ export default function App() {
         }
       }
 
+      if (supportsDirectoryStorage && db.appMeta) {
+        const storedDirectory = await db.appMeta.get("backupDirectoryHandle");
+        if (storedDirectory?.value) {
+          try {
+            await storeBackupDirectoryHandle(storedDirectory.value);
+          } catch {
+            await clearStoredBackupDirectoryHandle();
+          }
+        }
+      }
+
       await mergeDuplicateMaterials();
       await loadSettings();
       await loadAll();
@@ -440,6 +713,16 @@ export default function App() {
     // Autosave is intentionally driven by the latest loaded state plus the active file binding.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [materials, colors, purchases, parts, partPurchases, products, prints, settings, dataFileHandle]);
+
+  useEffect(() => {
+    if (!settings.printers?.length) {
+      return;
+    }
+
+    if (!settings.printers.some((printer) => printer.id === run.printerId)) {
+      setRun((current) => ({ ...current, printerId: settings.printers[0].id }));
+    }
+  }, [run.printerId, settings.printers]);
 
   async function loadAll() {
     setMaterials(await db.materials.toArray());
@@ -477,12 +760,12 @@ export default function App() {
   async function loadSettings() {
     const stored = await db.settings.get(1);
     if (stored) {
-      setSettings(stored);
+      setSettings(normalizeSettings(stored));
     }
   }
 
   async function saveSettings() {
-    await db.settings.put({ ...settings, id: 1 });
+    await db.settings.put({ ...normalizeSettings(settings), id: 1 });
     showToast("Instellingen opgeslagen");
   }
 
@@ -590,6 +873,125 @@ export default function App() {
     showToast("Bestandskoppeling losgekoppeld");
   };
 
+  const chooseBackupDirectory = async () => {
+    if (!supportsDirectoryStorage) {
+      showToast("Snapshotmap wordt niet ondersteund in deze browser", false);
+      return;
+    }
+
+    try {
+      const handle = await window.showDirectoryPicker();
+      if (!(await ensureDirectoryPermission(handle))) {
+        showToast("Toegang tot snapshotmap geweigerd", false);
+        return;
+      }
+
+      await storeBackupDirectoryHandle(handle);
+      showToast("Snapshotmap gekoppeld");
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        showToast("Kiezen van snapshotmap mislukt", false);
+      }
+    }
+  };
+
+  const disconnectBackupDirectory = async () => {
+    await clearStoredBackupDirectoryHandle();
+    showToast("Snapshotmap losgekoppeld");
+  };
+
+  const addPrinterProfile = () => {
+    const name = printerForm.name.trim();
+    if (!name) {
+      showToast("Geef de printer een naam", false);
+      return;
+    }
+
+    setSettings((current) => ({
+      ...current,
+      printers: [
+        ...(current.printers || []),
+        {
+          id: crypto.randomUUID(),
+          name,
+          powerLow: Number(printerForm.powerLow),
+          powerMid: Number(printerForm.powerMid),
+          powerHigh: Number(printerForm.powerHigh),
+        },
+      ],
+    }));
+    setPrinterForm({ name: "", powerLow: 150, powerMid: 180, powerHigh: 220 });
+  };
+
+  const removePrinterProfile = (printerId) => {
+    setSettings((current) => {
+      const nextPrinters = (current.printers || []).filter((printer) => printer.id !== printerId);
+      if (nextPrinters.length === 0) {
+        showToast("Minstens één printerprofiel is nodig", false);
+        return current;
+      }
+      return { ...current, printers: nextPrinters };
+    });
+  };
+
+  const addOverhead = () => {
+    const name = overheadForm.name.trim();
+    if (!name) {
+      showToast("Geef de overhead een naam", false);
+      return;
+    }
+
+    setSettings((current) => ({
+      ...current,
+      overheads: [
+        ...(current.overheads || []),
+        {
+          id: crypto.randomUUID(),
+          name,
+          amount: Number(overheadForm.amount),
+          mode: overheadForm.mode,
+        },
+      ],
+    }));
+    setOverheadForm({ name: "", amount: 0, mode: "monthly" });
+  };
+
+  const removeOverhead = (overheadId) => {
+    setSettings((current) => ({
+      ...current,
+      overheads: (current.overheads || []).filter((entry) => entry.id !== overheadId),
+    }));
+  };
+
+  const addDepreciation = () => {
+    const name = depreciationForm.name.trim();
+    if (!name) {
+      showToast("Geef de afschrijving een naam", false);
+      return;
+    }
+
+    setSettings((current) => ({
+      ...current,
+      depreciations: [
+        ...(current.depreciations || []),
+        {
+          id: crypto.randomUUID(),
+          name,
+          amount: Number(depreciationForm.amount),
+          mode: depreciationForm.mode,
+        },
+      ],
+    }));
+    setDepreciationForm({ name: "", amount: 0, mode: "perPrint" });
+  };
+
+  const removeDepreciation = (depreciationId) => {
+    setSettings((current) => ({
+      ...current,
+      depreciations: (current.depreciations || []).filter((entry) => entry.id !== depreciationId),
+    }));
+  };
+
   // ---------- CRUD ----------
   const addMaterial = async () => {
     const name = mName.trim();
@@ -659,6 +1061,7 @@ export default function App() {
       colorId: Number(buy.colorId),
       grams: Number(buy.grams),
       price: Number(buy.price),
+      notes: buy.notes.trim(),
       date: new Date(),
     });
 
@@ -667,7 +1070,7 @@ export default function App() {
       await db.colors.update(color.id, { stock: Number(color.stock || 0) + Number(buy.grams) });
     }
 
-    setBuy({ colorId: "", grams: 0, price: 0 });
+    setBuy({ colorId: "", grams: 0, price: 0, notes: "" });
     await loadAll();
     showToast("Inkoop toegevoegd");
   };
@@ -715,6 +1118,7 @@ export default function App() {
       partId: Number(partBuy.partId),
       amount: Number(partBuy.amount),
       price: Number(partBuy.price),
+      notes: partBuy.notes.trim(),
       date: new Date(),
     });
 
@@ -723,7 +1127,7 @@ export default function App() {
       await db.parts.update(part.id, { stock: Number(part.stock || 0) + Number(partBuy.amount) });
     }
 
-    setPartBuy({ partId: "", amount: 1, price: 0 });
+    setPartBuy({ partId: "", amount: 1, price: 0, notes: "" });
     await loadAll();
     showToast("Onderdeleninkoop toegevoegd");
   };
@@ -747,6 +1151,7 @@ export default function App() {
       workTime: Number(prod.workTime),
       link: prod.link.trim(),
       image: prod.image.trim(),
+      notes: prod.notes.trim(),
       components: (prod.components || [])
         .filter((component) => component.name?.trim())
         .map((component) => ({
@@ -765,7 +1170,7 @@ export default function App() {
       showToast("Product toegevoegd");
     }
 
-    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
+    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", notes: "", components: [] });
     setComponentForm({ name: "", cost: 0 });
     await loadAll();
   };
@@ -775,6 +1180,7 @@ export default function App() {
     setProd({
       ...product,
       grams: undefined,
+      notes: product.notes || "",
       components: (product.components || []).map((component) => ({
         id: component.id || crypto.randomUUID(),
         name: component.name || "",
@@ -794,8 +1200,8 @@ export default function App() {
   const addPrint = async () => {
     const filamentUses = normalizeFilamentUses(run.filamentUses);
 
-    if (!run.productId || !run.amount || filamentUses.length === 0) {
-      showToast("Kies product, aantal en filamentgebruik", false);
+    if (!run.productId || !run.printerId || !run.amount || filamentUses.length === 0) {
+      showToast("Kies product, printer, aantal en filamentgebruik", false);
       return;
     }
 
@@ -804,8 +1210,10 @@ export default function App() {
     await db.prints.add({
       ...run,
       productId: Number(run.productId),
+      printerId: run.printerId,
       amount: Number(run.amount),
       sellingPrice: Number(run.sellingPrice),
+      notes: run.notes.trim(),
       filamentUses,
       date: new Date(),
     });
@@ -821,7 +1229,14 @@ export default function App() {
       }
     }
 
-    setRun({ productId: "", amount: 1, sellingPrice: 0, filamentUses: [] });
+    setRun({
+      productId: "",
+      printerId: settings.printers?.[0]?.id || "default-printer",
+      amount: 1,
+      sellingPrice: 0,
+      notes: "",
+      filamentUses: [],
+    });
     setFilamentForm({ colorId: "", grams: 0 });
     await loadAll();
     showToast("Print opgeslagen");
@@ -901,6 +1316,8 @@ export default function App() {
         parts: 0,
         electricity: 0,
         labor: 0,
+        overhead: 0,
+        depreciation: 0,
         cost: 0,
         revenue: 0,
         profit: 0,
@@ -909,7 +1326,7 @@ export default function App() {
       };
     }
 
-    const breakdown = calcCostBreakdown(product, Number(run.amount || 0), run.filamentUses, purchases, settings);
+    const breakdown = calcCostBreakdown(product, Number(run.amount || 0), run.filamentUses, purchases, settings, run.printerId);
     const revenue = Number(run.sellingPrice || 0) * Number(run.amount || 0);
     const suggested = breakdown.total * (1 + (settings.margin || 30) / 100);
 
@@ -932,11 +1349,19 @@ export default function App() {
       }
 
       const filamentUses = getFilamentUsesForRecord(print, product);
-      const costBreakdown = calcCostBreakdown(product, Number(print.amount), filamentUses, purchases, settings);
+      const costBreakdown = calcCostBreakdown(product, Number(print.amount), filamentUses, purchases, settings, print.printerId);
       const revenue = Number(print.sellingPrice) * Number(print.amount);
       const profit = revenue - costBreakdown.total;
       return {
+        id: print.id,
         name: product.name,
+        productId: product.id,
+        printerId: print.printerId || settings.printers?.[0]?.id || "default-printer",
+        printerName: costBreakdown.printerName,
+        date: print.date,
+        amount: Number(print.amount),
+        notes: print.notes || "",
+        filamentUses,
         revenue,
         profit,
         cost: costBreakdown.total,
@@ -944,22 +1369,53 @@ export default function App() {
         parts: costBreakdown.parts,
         electricity: costBreakdown.electricity,
         labor: costBreakdown.labor,
+        overhead: costBreakdown.overhead,
+        depreciation: costBreakdown.depreciation,
+        averageProfitPerUnit: Number(print.amount) ? profit / Number(print.amount) : 0,
+        marginPercent: revenue ? (profit / revenue) * 100 : 0,
       };
     })
     .filter(Boolean);
 
-  const chart = printAnalytics.map((entry) => ({ name: entry.name, profit: entry.profit }));
-  const total = printAnalytics.reduce((sum, entry) => sum + entry.profit, 0);
-  const totalRevenue = printAnalytics.reduce((sum, entry) => sum + entry.revenue, 0);
-  const totalCost = printAnalytics.reduce((sum, entry) => sum + entry.cost, 0);
-  const totalFilamentCost = printAnalytics.reduce((sum, entry) => sum + entry.filament, 0);
-  const totalProductPartCost = printAnalytics.reduce((sum, entry) => sum + entry.parts, 0);
-  const totalElectricityCost = printAnalytics.reduce((sum, entry) => sum + entry.electricity, 0);
-  const totalLaborCost = printAnalytics.reduce((sum, entry) => sum + entry.labor, 0);
-  const totalMaterialSpend = purchases.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
-  const totalPartSpend = partPurchases.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
+  const overviewRange = getDateRangeForPreset(overviewPeriod, overviewFrom, overviewTo);
+  const filteredPrintAnalytics = printAnalytics.filter((entry) => isWithinDateRange(entry.date, overviewRange.from, overviewRange.to));
+  const filteredPurchasesForOverview = purchases.filter((entry) => isWithinDateRange(entry.date, overviewRange.from, overviewRange.to));
+  const filteredPartPurchasesForOverview = partPurchases.filter((entry) => isWithinDateRange(entry.date, overviewRange.from, overviewRange.to));
+
+  const monthlyOverheadCost = (settings.overheads || [])
+    .filter((entry) => entry.mode === "monthly")
+    .reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const monthCountInRange = (() => {
+    if (!overviewRange.from || !overviewRange.to) {
+      return 1;
+    }
+    const from = new Date(overviewRange.from.getFullYear(), overviewRange.from.getMonth(), 1);
+    const to = new Date(overviewRange.to.getFullYear(), overviewRange.to.getMonth(), 1);
+    return Math.max(1, (to.getFullYear() - from.getFullYear()) * 12 + to.getMonth() - from.getMonth() + 1);
+  })();
+  const totalMonthlyOverheadForRange = monthlyOverheadCost * monthCountInRange;
+
+  const chart = filteredPrintAnalytics.map((entry) => ({ name: entry.name, profit: entry.profit }));
+  const total = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.profit, 0);
+  const totalRevenue = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.revenue, 0);
+  const totalCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.cost, 0);
+  const totalFilamentCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.filament, 0);
+  const totalProductPartCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.parts, 0);
+  const totalElectricityCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.electricity, 0);
+  const totalLaborCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.labor, 0);
+  const totalOverheadCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.overhead, 0);
+  const totalDepreciationCost = filteredPrintAnalytics.reduce((sum, entry) => sum + entry.depreciation, 0);
+  const totalMaterialSpend = filteredPurchasesForOverview.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
+  const totalPartSpend = filteredPartPurchasesForOverview.reduce((sum, purchase) => sum + Number(purchase.price || 0), 0);
   const totalSupplySpend = totalMaterialSpend + totalPartSpend;
-  const netResult = totalRevenue - totalSupplySpend - totalElectricityCost - totalLaborCost;
+  const netResult =
+    totalRevenue -
+    totalSupplySpend -
+    totalElectricityCost -
+    totalLaborCost -
+    totalOverheadCost -
+    totalDepreciationCost -
+    totalMonthlyOverheadForRange;
   const stockMaterialValue = colors.reduce((sum, color) => {
     const stock = Number(color.stock || 0);
     const pricePerKg = avgPricePerKg(purchases, color.id);
@@ -982,6 +1438,155 @@ export default function App() {
         price: avgPricePerKg(purchases, color.id),
       })),
   );
+
+  const filteredMaterials = materials.filter((material) => {
+    const query = searchMaterials.trim().toLowerCase();
+    if (!query) {
+      return true;
+    }
+
+    const materialMatch = material.name.toLowerCase().includes(query);
+    const colorMatch = colors.some((color) => color.materialId == material.id && color.name.toLowerCase().includes(query));
+    return materialMatch || colorMatch;
+  });
+
+  const filteredParts = parts.filter((part) => {
+    const query = searchParts.trim().toLowerCase();
+    if (!query) {
+      return true;
+    }
+
+    return [part.name, part.category, part.notes]
+      .filter(Boolean)
+      .some((value) => value.toLowerCase().includes(query));
+  });
+
+  const filteredProducts = products.filter((product) => {
+    const query = searchProducts.trim().toLowerCase();
+    if (!query) {
+      return true;
+    }
+
+    const componentMatch = (product.components || []).some((component) => component.name?.toLowerCase().includes(query));
+    return [product.name, product.link, product.notes]
+      .filter(Boolean)
+      .some((value) => value.toLowerCase().includes(query)) || componentMatch;
+  });
+
+  const recentPurchases = purchases.slice().sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
+  const recentPartPurchases = partPurchases.slice().sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
+  const recentPrints = prints.slice().sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
+  const productMarginRows = filteredPrintAnalytics
+    .reduce((map, entry) => {
+      const current = map.get(entry.productId) || {
+        productId: entry.productId,
+        name: entry.name,
+        printerNames: new Set(),
+        revenue: 0,
+        profit: 0,
+        quantity: 0,
+      };
+      current.revenue += entry.revenue;
+      current.profit += entry.profit;
+      current.quantity += entry.amount;
+      if (entry.printerName) {
+        current.printerNames.add(entry.printerName);
+      }
+      map.set(entry.productId, current);
+      return map;
+    }, new Map())
+    .values();
+  const productMargins = Array.from(productMarginRows).map((entry) => ({
+    ...entry,
+    averageProfitPerUnit: entry.quantity ? entry.profit / entry.quantity : 0,
+    marginPercent: entry.revenue ? (entry.profit / entry.revenue) * 100 : 0,
+    printerNames: Array.from(entry.printerNames),
+  }));
+  const topMarginProducts = productMargins.slice().sort((a, b) => b.profit - a.profit).slice(0, 5);
+  const lowMarginProducts = productMargins
+    .filter((entry) => entry.quantity > 0)
+    .slice()
+    .sort((a, b) => a.averageProfitPerUnit - b.averageProfitPerUnit)
+    .slice(0, 5);
+  const timelineEntries = [
+    ...filteredPurchasesForOverview.map((purchase) => {
+      const color = colors.find((entry) => entry.id == purchase.colorId);
+      const material = materials.find((entry) => entry.id == color?.materialId);
+      return {
+        id: `filament-${purchase.id}`,
+        date: purchase.date,
+        type: "filamentPurchase",
+        label: color?.name || "Filament purchase",
+        productId: "",
+        materialId: color?.materialId || "",
+        amount: -Number(purchase.price || 0),
+        notes: purchase.notes || "",
+        meta: `${material?.name || ""} ${purchase.grams}g`.trim(),
+      };
+    }),
+    ...filteredPartPurchasesForOverview.map((purchase) => {
+      const part = parts.find((entry) => entry.id == purchase.partId);
+      return {
+        id: `part-${purchase.id}`,
+        date: purchase.date,
+        type: "partPurchase",
+        label: part?.name || "Part purchase",
+        productId: "",
+        materialId: "",
+        amount: -Number(purchase.price || 0),
+        notes: purchase.notes || "",
+        meta: `${purchase.amount} pcs`,
+      };
+    }),
+    ...filteredPrintAnalytics.map((entry) => {
+      const materialIds = [...new Set(entry.filamentUses.map((use) => colors.find((color) => color.id == use.colorId)?.materialId).filter(Boolean))];
+      return {
+        id: `sale-${entry.id}`,
+        date: entry.date,
+        type: "sale",
+        label: entry.name,
+        productId: entry.productId,
+        materialId: materialIds[0] || "",
+        amount: entry.revenue,
+        notes: entry.notes,
+        meta: `${entry.amount} pcs | profit EUR ${entry.profit.toFixed(2)}`,
+      };
+    }),
+    ...(totalMonthlyOverheadForRange > 0
+      ? [
+          {
+            id: `overhead-${overviewPeriod}-${overviewFrom}-${overviewTo}`,
+            date: overviewRange.to || new Date(),
+            type: "overhead",
+            label: "Monthly overhead allocation",
+            productId: "",
+            materialId: "",
+            amount: -totalMonthlyOverheadForRange,
+            notes: "",
+            meta: `${monthCountInRange} month(s)`,
+          },
+        ]
+      : []),
+  ]
+    .filter((entry) => {
+      if (timelineTypeFilter !== "all" && entry.type !== timelineTypeFilter) {
+        return false;
+      }
+      if (timelineProductFilter && `${entry.productId}` !== `${timelineProductFilter}`) {
+        return false;
+      }
+      if (timelineMaterialFilter && `${entry.materialId}` !== `${timelineMaterialFilter}`) {
+        return false;
+      }
+      if (timelineMonthFilter) {
+        const monthValue = new Date(entry.date).toISOString().slice(0, 7);
+        if (monthValue !== timelineMonthFilter) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
 
   return (
     <>
@@ -1021,6 +1626,7 @@ export default function App() {
           <Box>
             <In label="Materiaal naam" value={mName} onChange={(event) => setMName(event.target.value)} />
             <Btn onClick={addMaterial}>Toevoegen</Btn>
+            <In label="Zoeken in materialen en kleuren" value={searchMaterials} onChange={(event) => setSearchMaterials(event.target.value)} />
 
             <In
               label="Kleur naam"
@@ -1042,7 +1648,7 @@ export default function App() {
             <Btn onClick={addColor}>Toevoegen</Btn>
 
             <h3>Voorraad</h3>
-            {materials.map((material) => (
+            {filteredMaterials.map((material) => (
               <div key={material.id} style={{ marginBottom: 16 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                   <strong>{material.name}</strong>
@@ -1111,13 +1717,29 @@ export default function App() {
             </select>
             <In label="Gram" type="number" value={buy.grams} onChange={(event) => setBuy({ ...buy, grams: event.target.value })} />
             <In label="Prijs" type="number" value={buy.price} onChange={(event) => setBuy({ ...buy, price: event.target.value })} />
+            <In label="Notities" value={buy.notes} onChange={(event) => setBuy({ ...buy, notes: event.target.value })} />
             <Btn onClick={addPurchase}>Toevoegen</Btn>
+
+            <h4>Recente filamentaankopen</h4>
+            {recentPurchases.length === 0 && <p>Nog geen filamentaankopen.</p>}
+            {recentPurchases.map((purchase) => {
+              const color = colors.find((entry) => entry.id == purchase.colorId);
+              return (
+                <div key={purchase.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                  <div>
+                    <strong>{color?.name || "Onbekende kleur"}</strong> - {purchase.grams}g - EUR {Number(purchase.price || 0).toFixed(2)}
+                  </div>
+                  {purchase.notes && <div style={{ opacity: 0.8, marginTop: 4 }}>{purchase.notes}</div>}
+                </div>
+              );
+            })}
           </Box>
         )}
 
         {tab === "parts" && (
           <Box>
             <h3>Overige onderdelen</h3>
+            <In label="Zoeken in onderdelen" value={searchParts} onChange={(event) => setSearchParts(event.target.value)} />
             <In
               label="Onderdeel naam"
               value={partForm.name}
@@ -1155,11 +1777,26 @@ export default function App() {
               value={partBuy.price}
               onChange={(event) => setPartBuy({ ...partBuy, price: event.target.value })}
             />
+            <In label="Notities" value={partBuy.notes} onChange={(event) => setPartBuy({ ...partBuy, notes: event.target.value })} />
             <Btn onClick={addPartPurchase}>Inkoop toevoegen</Btn>
 
+            <h4>Recente onderdelenaankopen</h4>
+            {recentPartPurchases.length === 0 && <p>Nog geen onderdelenaankopen.</p>}
+            {recentPartPurchases.map((purchase) => {
+              const part = parts.find((entry) => entry.id == purchase.partId);
+              return (
+                <div key={purchase.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                  <div>
+                    <strong>{part?.name || "Onbekend onderdeel"}</strong> - {purchase.amount} stuks - EUR {Number(purchase.price || 0).toFixed(2)}
+                  </div>
+                  {purchase.notes && <div style={{ opacity: 0.8, marginTop: 4 }}>{purchase.notes}</div>}
+                </div>
+              );
+            })}
+
             <h4>Voorraad</h4>
-            {parts.length === 0 && <p>Nog geen overige onderdelen toegevoegd.</p>}
-            {parts.map((part) => (
+            {filteredParts.length === 0 && <p>Geen onderdelen gevonden.</p>}
+            {filteredParts.map((part) => (
               <div
                 key={part.id}
                 style={{
@@ -1198,6 +1835,7 @@ export default function App() {
 
         {tab === "products" && (
           <Box>
+            <In label="Zoeken in producten" value={searchProducts} onChange={(event) => setSearchProducts(event.target.value)} />
             <In label="Naam" value={prod.name} onChange={(event) => setProd({ ...prod, name: event.target.value })} />
             <In
               label="Printtijd"
@@ -1217,6 +1855,15 @@ export default function App() {
               value={prod.image}
               onChange={(event) => setProd({ ...prod, image: event.target.value })}
             />
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ display: "block", marginBottom: 6 }}>Notities</label>
+              <textarea
+                value={prod.notes}
+                onChange={(event) => setProd({ ...prod, notes: event.target.value })}
+                rows={4}
+                style={{ ...inputStyle, resize: "vertical" }}
+              />
+            </div>
             <h3>Onderdelen per product</h3>
             <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(120px, 1fr) auto", gap: 10, alignItems: "end" }}>
               <In
@@ -1268,7 +1915,7 @@ export default function App() {
                   style={{ background: "#4b5563" }}
                   onClick={() => {
                     setEditProduct(null);
-                    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", components: [] });
+                    setProd({ name: "", printTime: 0, workTime: 0, link: "", image: "", notes: "", components: [] });
                     setComponentForm({ name: "", cost: 0 });
                   }}
                 >
@@ -1278,7 +1925,7 @@ export default function App() {
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
-              {products.map((product) => (
+              {filteredProducts.map((product) => (
                 <div
                   key={product.id}
                   style={{
@@ -1303,6 +1950,7 @@ export default function App() {
                   <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
                     Onderdelen: EUR {getComponentCostPerUnit(product).toFixed(2)} per stuk
                   </div>
+                  {product.notes && <div style={{ fontSize: 12, opacity: 0.85, marginTop: 8 }}>{product.notes}</div>}
                   <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
                     <Btn onClick={() => startEdit(product)}>Bewerken</Btn>
                     {product.link && (
@@ -1335,6 +1983,19 @@ export default function App() {
               ))}
             </select>
 
+            <select
+              value={run.printerId}
+              onChange={(event) => setRun({ ...run, printerId: event.target.value })}
+              style={selectStyle}
+            >
+              <option value="">Printer</option>
+              {(settings.printers || []).map((printer) => (
+                <option key={printer.id} value={printer.id}>
+                  {printer.name}
+                </option>
+              ))}
+            </select>
+
             <In
               label="Aantal"
               type="number"
@@ -1347,6 +2008,15 @@ export default function App() {
               value={run.sellingPrice}
               onChange={(event) => setRun({ ...run, sellingPrice: Number(event.target.value) })}
             />
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ display: "block", marginBottom: 6 }}>Notities</label>
+              <textarea
+                value={run.notes}
+                onChange={(event) => setRun({ ...run, notes: event.target.value })}
+                rows={3}
+                style={{ ...inputStyle, resize: "vertical" }}
+              />
+            </div>
 
             <h3>Filamentgebruik per print</h3>
             <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(120px, 1fr) auto", gap: 10, alignItems: "end" }}>
@@ -1427,22 +2097,64 @@ export default function App() {
             <p>Onderdelen: EUR {live.parts.toFixed(2)}</p>
             <p>Stroom: EUR {live.electricity.toFixed(2)}</p>
             <p>Arbeid: EUR {live.labor.toFixed(2)}</p>
+            <p>Overhead: EUR {live.overhead.toFixed(2)}</p>
+            <p>Afschrijving: EUR {live.depreciation.toFixed(2)}</p>
             <p>Kost totaal: EUR {live.cost.toFixed(2)}</p>
             <p>Aanbevolen prijs: EUR {live.suggested.toFixed(2)}</p>
             <p style={{ color: live.profit < 0 ? "#fca5a5" : "#86efac" }}>Winst: EUR {live.profit.toFixed(2)}</p>
 
             <Btn onClick={addPrint}>Opslaan</Btn>
+
+            <h4>Recente prints</h4>
+            {recentPrints.length === 0 && <p>Nog geen prints opgeslagen.</p>}
+            {recentPrints.map((print) => {
+              const product = products.find((entry) => entry.id == print.productId);
+              return (
+                <div key={print.id} style={{ marginTop: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                  <div>
+                    <strong>{product?.name || "Onbekend product"}</strong> - {print.amount} stuks - EUR {Number(print.sellingPrice || 0).toFixed(2)}
+                  </div>
+                  {print.notes && <div style={{ opacity: 0.8, marginTop: 4 }}>{print.notes}</div>}
+                </div>
+              );
+            })}
           </Box>
         )}
 
         {tab === "dashboard" && (
           <Box>
             <h3>Overzicht</h3>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+              <Btn onClick={() => setOverviewPeriod("today")} style={{ background: overviewPeriod === "today" ? "#1d4ed8" : "#374151" }}>
+                Vandaag
+              </Btn>
+              <Btn onClick={() => setOverviewPeriod("week")} style={{ background: overviewPeriod === "week" ? "#1d4ed8" : "#374151" }}>
+                Deze week
+              </Btn>
+              <Btn onClick={() => setOverviewPeriod("month")} style={{ background: overviewPeriod === "month" ? "#1d4ed8" : "#374151" }}>
+                Deze maand
+              </Btn>
+              <Btn onClick={() => setOverviewPeriod("year")} style={{ background: overviewPeriod === "year" ? "#1d4ed8" : "#374151" }}>
+                Dit jaar
+              </Btn>
+              <Btn onClick={() => setOverviewPeriod("custom")} style={{ background: overviewPeriod === "custom" ? "#1d4ed8" : "#374151" }}>
+                Custom
+              </Btn>
+            </div>
+            {overviewPeriod === "custom" && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginBottom: 16 }}>
+                <In label="Van" type="date" value={overviewFrom} onChange={(event) => setOverviewFrom(event.target.value)} />
+                <In label="Tot" type="date" value={overviewTo} onChange={(event) => setOverviewTo(event.target.value)} />
+              </div>
+            )}
             <p>Totale omzet uit verkopen: EUR {totalRevenue.toFixed(2)}</p>
             <p>Materiaalverbruik in verkochte prints: EUR {totalFilamentCost.toFixed(2)}</p>
             <p>Productonderdelen in verkochte prints: EUR {totalProductPartCost.toFixed(2)}</p>
             <p>Stroomkosten in verkochte prints: EUR {totalElectricityCost.toFixed(2)}</p>
             <p>Arbeidskosten in verkochte prints: EUR {totalLaborCost.toFixed(2)}</p>
+            <p>Overhead per order in verkochte prints: EUR {totalOverheadCost.toFixed(2)}</p>
+            <p>Afschrijving in verkochte prints: EUR {totalDepreciationCost.toFixed(2)}</p>
+            <p>Maandelijkse overhead in periode: EUR {totalMonthlyOverheadForRange.toFixed(2)}</p>
             <p>Totale kostprijs van verkochte prints: EUR {totalCost.toFixed(2)}</p>
             <p>Brutowinst op verkochte prints: EUR {total.toFixed(2)}</p>
 
@@ -1484,11 +2196,77 @@ export default function App() {
                   {entry.name}: EUR {entry.profit.toFixed(2)}
                 </div>
               ))}
+            <h4>Top winstmakers</h4>
+            {topMarginProducts.length === 0 && <p>Geen productdata in deze periode.</p>}
+            {topMarginProducts.map((entry) => (
+              <div key={`top-product-${entry.productId}`} style={{ marginBottom: 8 }}>
+                {entry.name}: EUR {entry.profit.toFixed(2)} totaal | EUR {entry.averageProfitPerUnit.toFixed(2)} per stuk | {entry.marginPercent.toFixed(1)}%
+              </div>
+            ))}
+
+            <h4>Lage marge bij verkochte producten</h4>
+            {lowMarginProducts.length === 0 && <p>Geen productdata in deze periode.</p>}
+            {lowMarginProducts.map((entry) => (
+              <div key={`low-margin-${entry.productId}`} style={{ marginBottom: 8, color: "#fca5a5" }}>
+                {entry.name}: {entry.quantity} stuks | EUR {entry.averageProfitPerUnit.toFixed(2)} per stuk | {entry.marginPercent.toFixed(1)}%
+              </div>
+            ))}
+
             <h4>Gemiddelde prijs per kilo</h4>
             {avgPrices.length === 0 && <p>Nog geen prijsdata beschikbaar.</p>}
             {avgPrices.map((entry) => (
               <div key={entry.name}>
                 {entry.name}: EUR {entry.price.toFixed(2)}/kg
+              </div>
+            ))}
+
+            <h4>Transactietijdlijn</h4>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", marginBottom: 6 }}>Type</label>
+                <select value={timelineTypeFilter} onChange={(event) => setTimelineTypeFilter(event.target.value)} style={selectStyle}>
+                  <option value="all">Alle types</option>
+                  <option value="sale">Verkopen</option>
+                  <option value="filamentPurchase">Filamentaankopen</option>
+                  <option value="partPurchase">Overige onderdelenaankopen</option>
+                  <option value="overhead">Maandelijkse overhead</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: "block", marginBottom: 6 }}>Product</label>
+                <select value={timelineProductFilter} onChange={(event) => setTimelineProductFilter(event.target.value)} style={selectStyle}>
+                  <option value="">Alle producten</option>
+                  {products.map((product) => (
+                    <option key={product.id} value={product.id}>
+                      {product.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label style={{ display: "block", marginBottom: 6 }}>Materiaal</label>
+                <select value={timelineMaterialFilter} onChange={(event) => setTimelineMaterialFilter(event.target.value)} style={selectStyle}>
+                  <option value="">Alle materialen</option>
+                  {materials.map((material) => (
+                    <option key={material.id} value={material.id}>
+                      {material.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <In label="Maand" type="month" value={timelineMonthFilter} onChange={(event) => setTimelineMonthFilter(event.target.value)} />
+            </div>
+            {timelineEntries.length === 0 && <p>Geen transacties gevonden voor de huidige filters.</p>}
+            {timelineEntries.map((entry) => (
+              <div key={entry.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                  <strong>{entry.label}</strong>
+                  <span style={{ color: entry.amount < 0 ? "#fca5a5" : "#86efac" }}>EUR {entry.amount.toFixed(2)}</span>
+                </div>
+                <div style={{ opacity: 0.8, marginTop: 4 }}>
+                  {new Date(entry.date).toLocaleString()} | {entry.type} {entry.meta ? `| ${entry.meta}` : ""}
+                </div>
+                {entry.notes && <div style={{ opacity: 0.85, marginTop: 4 }}>{entry.notes}</div>}
               </div>
             ))}
           </Box>
@@ -1520,9 +2298,26 @@ export default function App() {
                 </Btn>
               )}
             </div>
+            <p style={{ opacity: 0.8 }}>
+              Snapshotmap: {backupDirectoryHandle ? backupDirectoryName || "gekoppelde map" : "nog geen snapshotmap gekoppeld"}
+            </p>
+            <div style={{ marginBottom: 16 }}>
+              <Btn onClick={chooseBackupDirectory}>Snapshotmap kiezen</Btn>
+              {backupDirectoryHandle && <Btn onClick={() => void saveSnapshotToDirectory(true)}>Nu snapshot maken</Btn>}
+              {backupDirectoryHandle && (
+                <Btn style={{ background: "#4b5563" }} onClick={disconnectBackupDirectory}>
+                  Snapshotmap loskoppelen
+                </Btn>
+              )}
+            </div>
             {!supportsFileStorage && (
               <p style={{ color: "#fca5a5" }}>
                 Deze browser ondersteunt geen directe bestandsopslag. Gebruik in dat geval handmatig export/import.
+              </p>
+            )}
+            {!supportsDirectoryStorage && (
+              <p style={{ color: "#fca5a5" }}>
+                Deze browser ondersteunt geen aparte snapshotmap. Handmatige export blijft wel beschikbaar.
               </p>
             )}
 
@@ -1540,24 +2335,6 @@ export default function App() {
               onChange={(event) => setSettings({ ...settings, hourlyRate: Number(event.target.value) })}
             />
             <In
-              label="Power laag"
-              type="number"
-              value={settings.powerLow}
-              onChange={(event) => setSettings({ ...settings, powerLow: Number(event.target.value) })}
-            />
-            <In
-              label="Power midden"
-              type="number"
-              value={settings.powerMid}
-              onChange={(event) => setSettings({ ...settings, powerMid: Number(event.target.value) })}
-            />
-            <In
-              label="Power hoog"
-              type="number"
-              value={settings.powerHigh}
-              onChange={(event) => setSettings({ ...settings, powerHigh: Number(event.target.value) })}
-            />
-            <In
               label="Marge (%)"
               type="number"
               value={settings.margin}
@@ -1569,6 +2346,102 @@ export default function App() {
               value={settings.waste}
               onChange={(event) => setSettings({ ...settings, waste: Number(event.target.value) })}
             />
+
+            <h4>Printerprofielen</h4>
+            <In label="Printer naam" value={printerForm.name} onChange={(event) => setPrinterForm({ ...printerForm, name: event.target.value })} />
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10 }}>
+              <In
+                label="Power laag"
+                type="number"
+                value={printerForm.powerLow}
+                onChange={(event) => setPrinterForm({ ...printerForm, powerLow: Number(event.target.value) })}
+              />
+              <In
+                label="Power midden"
+                type="number"
+                value={printerForm.powerMid}
+                onChange={(event) => setPrinterForm({ ...printerForm, powerMid: Number(event.target.value) })}
+              />
+              <In
+                label="Power hoog"
+                type="number"
+                value={printerForm.powerHigh}
+                onChange={(event) => setPrinterForm({ ...printerForm, powerHigh: Number(event.target.value) })}
+              />
+            </div>
+            <Btn onClick={addPrinterProfile}>Printer toevoegen</Btn>
+            {(settings.printers || []).map((printer) => (
+              <div key={printer.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                <div>
+                  <strong>{printer.name}</strong> - laag {printer.powerLow}W | midden {printer.powerMid}W | hoog {printer.powerHigh}W
+                </div>
+                <Btn style={{ background: "#dc2626" }} onClick={() => removePrinterProfile(printer.id)}>
+                  Verwijderen
+                </Btn>
+              </div>
+            ))}
+
+            <h4>Vaste overhead</h4>
+            <In label="Naam" value={overheadForm.name} onChange={(event) => setOverheadForm({ ...overheadForm, name: event.target.value })} />
+            <In
+              label="Bedrag"
+              type="number"
+              value={overheadForm.amount}
+              onChange={(event) => setOverheadForm({ ...overheadForm, amount: Number(event.target.value) })}
+            />
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ display: "block", marginBottom: 6 }}>Type</label>
+              <select value={overheadForm.mode} onChange={(event) => setOverheadForm({ ...overheadForm, mode: event.target.value })} style={selectStyle}>
+                <option value="monthly">Per maand</option>
+                <option value="perOrder">Per order</option>
+              </select>
+            </div>
+            <Btn onClick={addOverhead}>Overhead toevoegen</Btn>
+            {(settings.overheads || []).map((entry) => (
+              <div key={entry.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                <div>
+                  <strong>{entry.name}</strong> - EUR {Number(entry.amount || 0).toFixed(2)} {entry.mode === "monthly" ? "per maand" : "per order"}
+                </div>
+                <Btn style={{ background: "#dc2626" }} onClick={() => removeOverhead(entry.id)}>
+                  Verwijderen
+                </Btn>
+              </div>
+            ))}
+
+            <h4>Afschrijving</h4>
+            <In
+              label="Naam"
+              value={depreciationForm.name}
+              onChange={(event) => setDepreciationForm({ ...depreciationForm, name: event.target.value })}
+            />
+            <In
+              label="Bedrag"
+              type="number"
+              value={depreciationForm.amount}
+              onChange={(event) => setDepreciationForm({ ...depreciationForm, amount: Number(event.target.value) })}
+            />
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ display: "block", marginBottom: 6 }}>Type</label>
+              <select
+                value={depreciationForm.mode}
+                onChange={(event) => setDepreciationForm({ ...depreciationForm, mode: event.target.value })}
+                style={selectStyle}
+              >
+                <option value="perPrint">Per print</option>
+                <option value="perHour">Per printuur</option>
+              </select>
+            </div>
+            <Btn onClick={addDepreciation}>Afschrijving toevoegen</Btn>
+            {(settings.depreciations || []).map((entry) => (
+              <div key={entry.id} style={{ marginBottom: 8, padding: 10, borderRadius: 8, background: "#111827" }}>
+                <div>
+                  <strong>{entry.name}</strong> - EUR {Number(entry.amount || 0).toFixed(2)} {entry.mode === "perHour" ? "per uur" : "per print"}
+                </div>
+                <Btn style={{ background: "#dc2626" }} onClick={() => removeDepreciation(entry.id)}>
+                  Verwijderen
+                </Btn>
+              </div>
+            ))}
             <Btn onClick={saveSettings}>Opslaan</Btn>
 
             <h4>Handmatige backup</h4>
